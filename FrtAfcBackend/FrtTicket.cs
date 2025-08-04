@@ -2,6 +2,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using K4os.Compression.LZ4;
+using Microsoft.Data.SqlClient;
 
 /// <summary>
 /// FrtTicket 0.1.0
@@ -10,9 +11,11 @@ using K4os.Compression.LZ4;
 /// </summary>
 public static class FrtTicket
 {
-    private static readonly byte[] MagicBytes = Encoding.UTF8.GetBytes("FRT"); // 3-byte header
+    // Constants
+    public static readonly byte[] MagicBytes = Encoding.UTF8.GetBytes("FRT"); // 3-byte header
+    public const string TimeZoneId = "China Standard Time"; // Change to your metro's timezone
 
-    private static byte[] XorObfuscate(byte[] data, byte[] key)
+    public static byte[] XorObfuscate(byte[] data, byte[] key)
     {
         byte[] result = new byte[data.Length];
         for (int i = 0; i < data.Length; i++)
@@ -234,5 +237,107 @@ public static class FrtTicket
         {
             return false;
         }
+    }
+
+    public static (ECDsa signingKey, byte[] xorKey) GetCurrentKeys(SqlConnection conn, SqlTransaction tx)
+    {
+        // First try to get existing valid keys
+        var (signingKey, xorKey) = TryGetValidKeys(conn, tx);
+        if (signingKey != null && xorKey != null)
+        {
+            return (signingKey, xorKey);
+        }
+
+        // Generate new keys if none exist or they're expired
+        return GenerateNewKeys(conn, tx);
+    }
+
+    public static (ECDsa? signingKey, byte[]? xorKey) TryGetValidKeys(SqlConnection conn, SqlTransaction tx)
+    {
+        using var cmd = new SqlCommand(
+            @"SELECT TOP 1 sk.PrivateKey, ok.KeyBytes 
+                FROM SigningKeys sk
+                JOIN ObfuscatingKeys ok ON sk.KeyVersion = ok.KeyVersion
+                WHERE sk.ExpiryDateTime > GETUTCDATE()
+                ORDER BY sk.KeyVersion DESC",
+            conn, tx);
+
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read())
+        {
+            return (null, null);
+        }
+
+        var privateKey = reader.GetString(0);
+        var xorKey = (byte[])reader.GetValue(1);
+
+        var signingKey = ECDsa.Create();
+        signingKey.ImportFromPem(privateKey);
+
+        return (signingKey, xorKey);
+    }
+
+    public static (ECDsa signingKey, byte[] xorKey) GenerateNewKeys(SqlConnection conn, SqlTransaction tx)
+    {
+        // Calculate expiry time (next 3 AM local time)
+        var localTimeZone = TimeZoneInfo.FindSystemTimeZoneById(TimeZoneId);
+        var nowLocal = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, localTimeZone);
+        var expiryLocal = nowLocal.Hour < 3
+            ? new DateTime(nowLocal.Year, nowLocal.Month, nowLocal.Day, 3, 0, 0)
+            : new DateTime(nowLocal.Year, nowLocal.Month, nowLocal.Day, 3, 0, 0).AddDays(1);
+        var expiryUtc = TimeZoneInfo.ConvertTimeToUtc(expiryLocal, localTimeZone);
+
+        // Generate new ECDSA key pair
+        using var newSigningKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var privateKey = newSigningKey.ExportECPrivateKeyPem();
+        var publicKey = newSigningKey.ExportSubjectPublicKeyInfoPem();
+
+        // Generate new XOR key
+        var newXorKey = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(newXorKey);
+
+        // Get next key version
+        var keyVersion = GetNextKeyVersion(conn, tx);
+
+        // Store both keys
+        using (var cmd = new SqlCommand(
+            "INSERT INTO SigningKeys (PrivateKey, PublicKey, StartDateTime, ExpiryDateTime, KeyVersion) " +
+            "VALUES (@privateKey, @publicKey, @start, @expiry, @version)",
+            conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@privateKey", privateKey);
+            cmd.Parameters.AddWithValue("@publicKey", publicKey);
+            cmd.Parameters.AddWithValue("@start", DateTime.UtcNow);
+            cmd.Parameters.AddWithValue("@expiry", expiryUtc);
+            cmd.Parameters.AddWithValue("@version", keyVersion);
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var cmd = new SqlCommand(
+            "INSERT INTO ObfuscatingKeys (KeyBytes, StartDateTime, ExpiryDateTime, KeyVersion) " +
+            "VALUES (@keyBytes, @start, @expiry, @version)",
+            conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@keyBytes", newXorKey);
+            cmd.Parameters.AddWithValue("@start", DateTime.UtcNow);
+            cmd.Parameters.AddWithValue("@expiry", expiryUtc);
+            cmd.Parameters.AddWithValue("@version", keyVersion);
+            cmd.ExecuteNonQuery();
+        }
+
+        // Return the new keys
+        var returnKey = ECDsa.Create();
+        returnKey.ImportFromPem(privateKey);
+
+        return (returnKey, newXorKey);
+    }
+
+    public static int GetNextKeyVersion(SqlConnection conn, SqlTransaction tx)
+    {
+        using var cmd = new SqlCommand(
+            "SELECT ISNULL(MAX(KeyVersion), 0) + 1 FROM SigningKeys",
+            conn, tx);
+        return Convert.ToInt32(cmd.ExecuteScalar());
     }
 }

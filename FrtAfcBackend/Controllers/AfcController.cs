@@ -12,7 +12,19 @@ namespace FrtAfcBackend.Controllers
     public struct TicketData
     {
         public string TicketString { get; set; }
+        public string TicketNumber { get; set; }
         public DateTime IssueTime { get; set; }
+    }
+
+    public struct FareInfo
+    {
+        public string FromStation { get; set; }
+        public string ToStation { get; set; }
+        public int FromZone { get; set; }
+        public int ToZone { get; set; }
+        public int FareCents { get; set; }
+        public string FromStationName { get; set; }
+        public string ToStationName { get; set; }
     }
 
     [ApiController]
@@ -51,10 +63,135 @@ namespace FrtAfcBackend.Controllers
             return ticketNumber;
         }
 
+        [NonAction]
+        private TicketData IssueTicketInternal(int valueCents, string issuingStation, byte ticketType)
+        {
+            using var connection = new SqlConnection(_connectionString);
+            connection.Open();
+
+            using var transaction = connection.BeginTransaction();
+
+            // 1. Generate ticket number
+            long ticketNumber = GenerateTicketNumberOnDB(connection, transaction);
+
+            // 2. Get cryptographic keys
+            var (signingKey, xorKey) = FrtTicket.GetCurrentKeys(connection, transaction);
+
+            // 3. Encode ticket
+            string ticketString = FrtTicket.EncodeTicket(
+                ticketNumber: ticketNumber,
+                valueCents: valueCents,
+                issuingStation: issuingStation,
+                issueDateTime: DateTime.UtcNow,
+                ticketType: ticketType,
+                signingKey: signingKey,
+                xorObfuscatorKey: xorKey);
+
+            // 4. Store in database
+            SaveTicket(connection, transaction,
+                ticketNumber: ticketNumber,
+                valueCents: valueCents,
+                issuingStation: issuingStation,
+                ticketType: ticketType,
+                ticketString: ticketString);
+
+            transaction.Commit();
+
+            return new TicketData
+            {
+                TicketString = ticketString,
+                TicketNumber = ticketNumber.ToString(),
+                IssueTime = DateTime.UtcNow
+            };
+        }
+
         [HttpGet("currentdatetime")]
         public IActionResult GetCurrentDateTime()
         {
             return Ok(DateTime.Now);
+        }
+
+        // Get fare between two stations
+        [HttpGet("fare")]
+        public IActionResult GetFare([FromQuery] FareRequest request)
+        {
+            // Automatic model validation
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                // Get station information and zones
+                using var cmd = new SqlCommand(@"
+                    SELECT 
+                        fs.StationCode as FromCode,
+                        fs.EnglishStationName as FromName,
+                        fs.ZoneID as FromZone,
+                        ts.StationCode as ToCode,
+                        ts.EnglishStationName as ToName,
+                        ts.ZoneID as ToZone
+                    FROM Stations fs
+                    CROSS JOIN Stations ts
+                    WHERE fs.StationCode = @fromStation 
+                      AND ts.StationCode = @toStation
+                      AND fs.IsActive = 1 
+                      AND ts.IsActive = 1", connection);
+
+                cmd.Parameters.AddWithValue("@fromStation", request.FromStation.ToUpper());
+                cmd.Parameters.AddWithValue("@toStation", request.ToStation.ToUpper());
+
+                using var reader = cmd.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return NotFound("One or both station codes not found or inactive");
+                }
+
+                var fromZone = reader.GetInt32("FromZone");
+                var toZone = reader.GetInt32("ToZone");
+                var fromName = reader.GetString("FromName");
+                var toName = reader.GetString("ToName");
+
+                reader.Close();
+
+                // Get fare from FareRules table
+                using var fareCmd = new SqlCommand(@"
+                    SELECT FareCents 
+                    FROM FareRules 
+                    WHERE FromZone = @fromZone AND ToZone = @toZone", connection);
+
+                fareCmd.Parameters.AddWithValue("@fromZone", fromZone);
+                fareCmd.Parameters.AddWithValue("@toZone", toZone);
+
+                var fareResult = fareCmd.ExecuteScalar();
+                if (fareResult == null)
+                {
+                    return NotFound($"No fare rule found for zone {fromZone} to zone {toZone}");
+                }
+
+                var fareCents = Convert.ToInt32(fareResult);
+
+                var fareInfo = new FareInfo
+                {
+                    FromStation = request.FromStation.ToUpper(),
+                    ToStation = request.ToStation.ToUpper(),
+                    FromZone = fromZone,
+                    ToZone = toZone,
+                    FareCents = fareCents,
+                    FromStationName = fromName,
+                    ToStationName = toName
+                };
+
+                return Ok(fareInfo);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Fare lookup failed: {ex.Message}");
+            }
         }
 
         // Ticket issuance function
@@ -69,157 +206,17 @@ namespace FrtAfcBackend.Controllers
 
             try
             {
-                using var connection = new SqlConnection(_connectionString);
-                connection.Open();
+                var ticketData = IssueTicketInternal(
+                    request.ValueCents,
+                    request.IssuingStation!,
+                    (byte)request.TicketType);
 
-                using var transaction = connection.BeginTransaction();
-
-                try
-                {
-                    // 1. Generate ticket number
-                    long ticketNumber = GenerateTicketNumberOnDB(connection, transaction);
-
-                    // 2. Get cryptographic keys
-                    var (signingKey, xorKey) = GetCurrentKeys(connection, transaction);
-
-                    // 3. Encode ticket
-                    string ticketString = FrtTicket.EncodeTicket(
-                        ticketNumber: ticketNumber,
-                        valueCents: request.ValueCents,
-                        issuingStation: request.IssuingStation!,
-                        issueDateTime: DateTime.UtcNow,
-                        ticketType: (byte)request.TicketType,
-                        signingKey: signingKey,
-                        xorObfuscatorKey: xorKey);
-
-                    // 4. Store in database
-                    SaveTicket(connection, transaction,
-                        ticketNumber: ticketNumber,
-                        valueCents: request.ValueCents,
-                        issuingStation: request.IssuingStation!,
-                        ticketType: (byte)request.TicketType,
-                        ticketString: ticketString);
-
-                    transaction.Commit();
-
-                    return Ok(new TicketData
-                    {
-                        TicketString = ticketString,
-                        IssueTime = DateTime.UtcNow
-                    });
-                }
-                catch (Exception ex)
-                {
-                    transaction.Rollback();
-                    return StatusCode(500, $"Ticket issuance failed: {ex.Message}");
-                }
+                return Ok(ticketData);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Database error: {ex.Message}");
+                return StatusCode(500, $"Ticket issuance failed: {ex.Message}");
             }
-        }
-
-        private (ECDsa signingKey, byte[] xorKey) GetCurrentKeys(SqlConnection conn, SqlTransaction tx)
-        {
-            // First try to get existing valid keys
-            var (signingKey, xorKey) = TryGetValidKeys(conn, tx);
-            if (signingKey != null && xorKey != null)
-            {
-                return (signingKey, xorKey);
-            }
-
-            // Generate new keys if none exist or they're expired
-            return GenerateNewKeys(conn, tx);
-        }
-
-        private (ECDsa? signingKey, byte[]? xorKey) TryGetValidKeys(SqlConnection conn, SqlTransaction tx)
-        {
-            using var cmd = new SqlCommand(
-                @"SELECT TOP 1 sk.PrivateKey, ok.KeyBytes 
-                FROM SigningKeys sk
-                JOIN ObfuscatingKeys ok ON sk.KeyVersion = ok.KeyVersion
-                WHERE sk.ExpiryDateTime > GETUTCDATE()
-                ORDER BY sk.KeyVersion DESC",
-                conn, tx);
-
-            using var reader = cmd.ExecuteReader();
-            if (!reader.Read())
-            {
-                return (null, null);
-            }
-
-            var privateKey = reader.GetString(0);
-            var xorKey = (byte[])reader.GetValue(1);
-
-            var signingKey = ECDsa.Create();
-            signingKey.ImportFromPem(privateKey);
-
-            return (signingKey, xorKey);
-        }
-
-        private (ECDsa signingKey, byte[] xorKey) GenerateNewKeys(SqlConnection conn, SqlTransaction tx)
-        {
-            // Calculate expiry time (next 3 AM local time)
-            var localTimeZone = TimeZoneInfo.FindSystemTimeZoneById(TimeZoneId);
-            var nowLocal = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, localTimeZone);
-            var expiryLocal = nowLocal.Hour < 3
-                ? new DateTime(nowLocal.Year, nowLocal.Month, nowLocal.Day, 3, 0, 0)
-                : new DateTime(nowLocal.Year, nowLocal.Month, nowLocal.Day, 3, 0, 0).AddDays(1);
-            var expiryUtc = TimeZoneInfo.ConvertTimeToUtc(expiryLocal, localTimeZone);
-
-            // Generate new ECDSA key pair
-            using var newSigningKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-            var privateKey = newSigningKey.ExportECPrivateKeyPem();
-            var publicKey = newSigningKey.ExportSubjectPublicKeyInfoPem();
-
-            // Generate new XOR key
-            var newXorKey = new byte[32];
-            using var rng = RandomNumberGenerator.Create();
-            rng.GetBytes(newXorKey);
-
-            // Get next key version
-            var keyVersion = GetNextKeyVersion(conn, tx);
-
-            // Store both keys
-            using (var cmd = new SqlCommand(
-                "INSERT INTO SigningKeys (PrivateKey, PublicKey, StartDateTime, ExpiryDateTime, KeyVersion) " +
-                "VALUES (@privateKey, @publicKey, @start, @expiry, @version)",
-                conn, tx))
-            {
-                cmd.Parameters.AddWithValue("@privateKey", privateKey);
-                cmd.Parameters.AddWithValue("@publicKey", publicKey);
-                cmd.Parameters.AddWithValue("@start", DateTime.UtcNow);
-                cmd.Parameters.AddWithValue("@expiry", expiryUtc);
-                cmd.Parameters.AddWithValue("@version", keyVersion);
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = new SqlCommand(
-                "INSERT INTO ObfuscatingKeys (KeyBytes, StartDateTime, ExpiryDateTime, KeyVersion) " +
-                "VALUES (@keyBytes, @start, @expiry, @version)",
-                conn, tx))
-            {
-                cmd.Parameters.AddWithValue("@keyBytes", newXorKey);
-                cmd.Parameters.AddWithValue("@start", DateTime.UtcNow);
-                cmd.Parameters.AddWithValue("@expiry", expiryUtc);
-                cmd.Parameters.AddWithValue("@version", keyVersion);
-                cmd.ExecuteNonQuery();
-            }
-
-            // Return the new keys
-            var returnKey = ECDsa.Create();
-            returnKey.ImportFromPem(privateKey);
-
-            return (returnKey, newXorKey);
-        }
-
-        private int GetNextKeyVersion(SqlConnection conn, SqlTransaction tx)
-        {
-            using var cmd = new SqlCommand(
-                "SELECT ISNULL(MAX(KeyVersion), 0) + 1 FROM SigningKeys",
-                conn, tx);
-            return Convert.ToInt32(cmd.ExecuteScalar());
         }
 
         private void SaveTicket(
@@ -254,7 +251,7 @@ namespace FrtAfcBackend.Controllers
             cmd.ExecuteNonQuery();
         }
 
-        [HttpGet("IssueDebugTicket")]
+        [HttpGet("issuedebugticket")]
         public IActionResult IssueDebugTicket()
         {
             if (!_debugMode)
@@ -264,56 +261,31 @@ namespace FrtAfcBackend.Controllers
 
             try
             {
-                using var connection = new SqlConnection(_connectionString);
-                connection.Open();
+                var ticketData = IssueTicketInternal(
+                    300,    // Fixed debug value
+                    "JLL",  // 俊霖路 station code
+                    255);   // Debug ticket type
 
-                using var transaction = connection.BeginTransaction();
-
-                try
-                {
-                    // 1. Generate ticket number
-                    long ticketNumber = GenerateTicketNumberOnDB(connection, transaction);
-
-                    // 2. Get cryptographic keys
-                    var (signingKey, xorKey) = GetCurrentKeys(connection, transaction);
-
-                    // 3. Encode debug ticket
-                    string ticketString = FrtTicket.EncodeTicket(
-                        ticketNumber: ticketNumber,
-                        valueCents: 300, // Fixed debug value
-                        issuingStation: "JLL", // 俊霖路 station code
-                        issueDateTime: DateTime.UtcNow,
-                        ticketType: 255, // Debug ticket type
-                        signingKey: signingKey,
-                        xorObfuscatorKey: xorKey);
-
-                    // 4. Store in database
-                    SaveTicket(connection, transaction,
-                        ticketNumber: ticketNumber,
-                        valueCents: 300,
-                        issuingStation: "JLL",
-                        ticketType: 255, // Debug type
-                        ticketString: ticketString);
-
-                    transaction.Commit();
-
-                    return Ok(new TicketData
-                    {
-                        TicketString = ticketString,
-                        IssueTime = DateTime.UtcNow
-                    });
-                }
-                catch (Exception ex)
-                {
-                    transaction.Rollback();
-                    return StatusCode(500, $"Debug ticket issuance failed: {ex.ToString()}");
-                }
+                return Ok(ticketData);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Database error: {ex.Message}");
+                return StatusCode(500, $"Debug ticket issuance failed: {ex.Message}");
             }
         }
+    }
+
+    public class FareRequest
+    {
+        [Required(ErrorMessage = "From station is required")]
+        [StringLength(3, MinimumLength = 3, ErrorMessage = "From station code must be 3 characters")]
+        [RegularExpression(@"^[A-Za-z]+$", ErrorMessage = "From station code must be letters only")]
+        public required string FromStation { get; set; }
+
+        [Required(ErrorMessage = "To station is required")]
+        [StringLength(3, MinimumLength = 3, ErrorMessage = "To station code must be 3 characters")]
+        [RegularExpression(@"^[A-Za-z]+$", ErrorMessage = "To station code must be letters only")]
+        public required string ToStation { get; set; }
     }
 
     public class TicketRequest
@@ -331,5 +303,4 @@ namespace FrtAfcBackend.Controllers
         [Range(0, 255, ErrorMessage = "Ticket type must be between 0 and 255")]
         public required int TicketType { get; set; }
     }
-
 }
