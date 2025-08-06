@@ -81,10 +81,11 @@ CREATE TABLE ApiUsers (
     Username NVARCHAR(50) NOT NULL UNIQUE,
     PasswordHash NVARCHAR(128) NOT NULL,
     Salt NVARCHAR(64) NOT NULL,
+	UserPermissions INT NOT NULL DEFAULT 0,
     IsActive BIT NOT NULL DEFAULT 1,
     CreatedDateTime DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
     LastLoginDateTime DATETIME2 NULL,
-    Description NVARCHAR(255) NULL
+    UserDescription NVARCHAR(255) NULL
 );
 
 -- Create index for faster username lookups
