@@ -227,10 +227,5 @@ WHERE type IN ('U', 'P', 'TR')
 ORDER BY type_desc, name;
 GO
 
--- Sample data
-INSERT INTO Stations (StationCode, ChineseStationName, EnglishStationName, ZoneID, IsActive)
-VALUES ('JLL', N'俊霖路', 'Junlin Road', 1, 1);
-PRINT 'Junlin Road added';
-
 PRINT 'FRT AFC database schema successfully created';
 GO
