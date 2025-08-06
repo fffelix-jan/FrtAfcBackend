@@ -1,4 +1,12 @@
-﻿USE frtafc;
+﻿-- Create the database if it doesn't exist
+IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = 'frtafc')
+BEGIN
+    CREATE DATABASE frtafc;
+    PRINT 'Database frtafc created';
+END
+GO
+
+USE frtafc;
 GO
 
 -- Stations Table with proper unique constraint
@@ -81,12 +89,13 @@ CREATE TABLE ApiUsers (
     Username NVARCHAR(50) NOT NULL UNIQUE,
     PasswordHash NVARCHAR(128) NOT NULL,
     Salt NVARCHAR(64) NOT NULL,
-	UserPermissions INT NOT NULL DEFAULT 0,
+    UserPermissions INT NOT NULL DEFAULT 0,
     IsActive BIT NOT NULL DEFAULT 1,
     CreatedDateTime DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
     LastLoginDateTime DATETIME2 NULL,
     UserDescription NVARCHAR(255) NULL
 );
+GO
 
 -- Create index for faster username lookups
 CREATE INDEX IX_ApiUsers_Username ON ApiUsers(Username);
@@ -97,42 +106,7 @@ ADD CONSTRAINT FK_Audit_Ticket
 FOREIGN KEY (TicketID) REFERENCES Tickets(InternalTicketID);
 GO
 
--- SP to generate ticket number
-CREATE OR ALTER PROCEDURE sp_GenerateTicketNumber
-    @TicketNumber BIGINT OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON;
-    
-    -- Phase 1: Batch generate 10 cryptographically random candidates
-    ;WITH RandomNumbers AS (
-        SELECT TOP 10 
-            ABS(100000000000 + (CONVERT(BIGINT, (899999999999999 * RAND(CHECKSUM(NEWID())))))) AS Num
-        FROM sys.objects
-    )
-    SELECT TOP 1 @TicketNumber = Num
-    FROM RandomNumbers
-    WHERE NOT EXISTS (SELECT 1 FROM Tickets WHERE TicketNumber = Num)
-      AND Num > 0 -- Explicit positive check
-    ORDER BY NEWID();
-    
-    -- Phase 2: Guaranteed positive fallback
-    IF @TicketNumber IS NULL
-    BEGIN
-        -- Timestamp + random suffix (always positive)
-        SET @TicketNumber = CONVERT(BIGINT, FORMAT(GETUTCDATE(), 'yyyyMMddHHmmssff')) 
-                          + (ABS(CHECKSUM(NEWID())) % 10000); -- Fixed: Added closing parenthesis
-        
-        -- Ensure both uniqueness AND positivity
-        WHILE EXISTS (SELECT 1 FROM Tickets WHERE TicketNumber = @TicketNumber) OR @TicketNumber <= 0
-            SET @TicketNumber = ABS(@TicketNumber + (1 + (ABS(CHECKSUM(NEWID())) % 9)));
-    END
-    
-    -- Final validation (defensive programming)
-    IF @TicketNumber <= 0
-        THROW 50001, 'Generated invalid ticket number (non-positive)', 1;
-END
-GO
+-- Now that all tables exist, create the stored procedures and triggers
 
 -- Corrected audit trigger
 CREATE OR ALTER TRIGGER tr_Tickets_Audit
@@ -207,6 +181,45 @@ BEGIN
 END;
 GO
 
+-- SP to generate ticket number (CORRECTED VERSION)
+CREATE PROCEDURE sp_GenerateTicketNumber
+    @TicketNumber BIGINT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Phase 1: Batch generate 10 cryptographically random candidates
+    ;WITH RandomNumbers AS (
+        SELECT TOP 10 
+            ABS(100000000000 + (CONVERT(BIGINT, (899999999999999 * RAND(CHECKSUM(NEWID())))))) AS Num
+        FROM sys.objects
+    )
+    SELECT TOP 1 @TicketNumber = Num
+    FROM RandomNumbers
+    WHERE NOT EXISTS (SELECT 1 FROM Tickets WHERE TicketNumber = Num)
+      AND Num > 0 -- Explicit positive check
+    ORDER BY NEWID();
+    
+    -- Phase 2: Guaranteed positive fallback
+    IF @TicketNumber IS NULL
+    BEGIN
+        -- Timestamp + random suffix (always positive)
+        SET @TicketNumber = CONVERT(BIGINT, FORMAT(GETUTCDATE(), 'yyyyMMddHHmmssff')) 
+                          + (ABS(CHECKSUM(NEWID())) % 10000);
+        
+        -- Ensure both uniqueness AND positivity
+        WHILE EXISTS (SELECT 1 FROM Tickets WHERE TicketNumber = @TicketNumber) OR @TicketNumber <= 0
+        BEGIN
+            SET @TicketNumber = ABS(@TicketNumber + (1 + (ABS(CHECKSUM(NEWID())) % 9)));
+        END
+    END
+    
+    -- Final validation (defensive programming)
+    IF @TicketNumber <= 0
+        THROW 50001, 'Generated invalid ticket number (non-positive)', 1;
+END
+GO
+
 -- Verification
 SELECT name, type_desc 
 FROM sys.objects 
@@ -214,9 +227,10 @@ WHERE type IN ('U', 'P', 'TR')
 ORDER BY type_desc, name;
 GO
 
-PRINT 'FRT AFC database schema successfully created';
-GO
-
+-- Sample data
 INSERT INTO Stations (StationCode, ChineseStationName, EnglishStationName, ZoneID, IsActive)
 VALUES ('JLL', N'俊霖路', 'Junlin Road', 1, 1);
 PRINT 'Junlin Road added';
+
+PRINT 'FRT AFC database schema successfully created';
+GO
