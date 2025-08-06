@@ -75,6 +75,21 @@ CREATE TABLE TicketAuditLog (
     INDEX IX_AuditLog_Ticket (TicketID)
 );
 
+-- Users Table
+CREATE TABLE ApiUsers (
+    Id INT IDENTITY(1,1) PRIMARY KEY,
+    Username NVARCHAR(50) NOT NULL UNIQUE,
+    PasswordHash NVARCHAR(128) NOT NULL,
+    Salt NVARCHAR(64) NOT NULL,
+    IsActive BIT NOT NULL DEFAULT 1,
+    CreatedDateTime DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
+    LastLoginDateTime DATETIME2 NULL,
+    Description NVARCHAR(255) NULL
+);
+
+-- Create index for faster username lookups
+CREATE INDEX IX_ApiUsers_Username ON ApiUsers(Username);
+
 -- Add foreign key to audit log after Tickets table exists
 ALTER TABLE TicketAuditLog
 ADD CONSTRAINT FK_Audit_Ticket 
