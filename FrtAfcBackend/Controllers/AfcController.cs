@@ -27,6 +27,15 @@ namespace FrtAfcBackend.Controllers
         public string ToStationName { get; set; }
     }
 
+    public struct StationInfo
+    {
+        public string StationCode { get; set; }
+        public string EnglishName { get; set; }
+        public string ChineseName { get; set; }
+        public int ZoneId { get; set; }
+        public bool IsActive { get; set; }
+    }
+
     [ApiController]
     [Route("api/v1/[controller]")]
     public class AfcController : ControllerBase
@@ -109,6 +118,56 @@ namespace FrtAfcBackend.Controllers
         public IActionResult GetCurrentDateTime()
         {
             return Ok(DateTime.Now);
+        }
+
+        // Get station information by station code
+        [HttpGet("getstationname")]
+        public IActionResult GetStationName([FromQuery] StationRequest request)
+        {
+            // Automatic model validation
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var cmd = new SqlCommand(@"
+                    SELECT 
+                        StationCode,
+                        EnglishStationName,
+                        ChineseStationName,
+                        ZoneID,
+                        IsActive
+                    FROM Stations 
+                    WHERE StationCode = @stationCode", connection);
+
+                cmd.Parameters.AddWithValue("@stationCode", request.StationCode.ToUpper());
+
+                using var reader = cmd.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return NotFound($"Station with code '{request.StationCode.ToUpper()}' not found");
+                }
+
+                var stationInfo = new StationInfo
+                {
+                    StationCode = reader.GetString("StationCode"),
+                    EnglishName = reader.GetString("EnglishStationName"),
+                    ChineseName = reader.GetString("ChineseStationName"),
+                    ZoneId = reader.GetInt32("ZoneID"),
+                    IsActive = reader.GetBoolean("IsActive")
+                };
+
+                return Ok(stationInfo);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Station lookup failed: {ex.Message}");
+            }
         }
 
         // Get fare between two stations
@@ -273,6 +332,14 @@ namespace FrtAfcBackend.Controllers
                 return StatusCode(500, $"Debug ticket issuance failed: {ex.Message}");
             }
         }
+    }
+
+    public class StationRequest
+    {
+        [Required(ErrorMessage = "Station code is required")]
+        [StringLength(3, MinimumLength = 3, ErrorMessage = "Station code must be exactly 3 characters")]
+        [RegularExpression(@"^[A-Za-z]+$", ErrorMessage = "Station code must contain only letters")]
+        public required string StationCode { get; set; }
     }
 
     public class FareRequest
