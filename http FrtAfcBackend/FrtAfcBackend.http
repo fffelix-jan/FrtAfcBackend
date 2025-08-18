@@ -1,0 +1,52 @@
+@FrtAfcBackend_HostAddress_HTTP = http://localhost:5281
+@FrtAfcBackend_HostAddress_HTTPS = https://localhost:7184
+@FrtAfcBackend_NetworkAddress_HTTP = http://YOUR_COMPUTER_IP:5281
+@FrtAfcBackend_NetworkAddress_HTTPS = https://YOUR_COMPUTER_IP:7184
+
+# Test HTTP endpoint locally
+GET {{FrtAfcBackend_HostAddress_HTTP}}/weatherforecast/
+Accept: application/json
+
+###
+
+# Test HTTPS endpoint locally
+GET {{FrtAfcBackend_HostAddress_HTTPS}}/weatherforecast/
+Accept: application/json
+
+###
+
+# Test HTTP from network
+GET {{FrtAfcBackend_NetworkAddress_HTTP}}/api/v1/afc/currentdatetime
+Accept: application/json
+
+###
+
+# Test HTTPS from network
+GET {{FrtAfcBackend_NetworkAddress_HTTPS}}/api/v1/afc/currentdatetime
+Accept: application/json
+
+###
+
+# Test debug ticket via HTTP
+GET {{FrtAfcBackend_NetworkAddress_HTTP}}/api/v1/afc/issuedebugticket
+Accept: application/json
+
+###
+
+# Test debug ticket via HTTPS
+GET {{FrtAfcBackend_NetworkAddress_HTTPS}}/api/v1/afc/issuedebugticket
+Accept: application/json
+
+###
+
+# Test station lookup via HTTP
+GET {{FrtAfcBackend_NetworkAddress_HTTP}}/api/v1/afc/getstationname?stationCode=JLL
+Accept: application/json
+
+###
+
+# Test station lookup via HTTPS
+GET {{FrtAfcBackend_NetworkAddress_HTTPS}}/api/v1/afc/getstationname?stationCode=JLL
+Accept: application/json
+
+###

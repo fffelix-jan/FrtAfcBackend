@@ -1,4 +1,5 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
 using System;
 using System.Data;
 using Microsoft.Data.SqlClient;
@@ -38,7 +39,7 @@ namespace FrtAfcBackend.Controllers
 
     [ApiController]
     [Route("api/v1/[controller]")]
-    public class AfcController : ControllerBase
+    public class AfcController : PermissionControllerBase
     {
         // Set this to false in production to disable debug ticket issuance and other stuff!!!!!
         private readonly bool _debugMode = true;
@@ -115,13 +116,22 @@ namespace FrtAfcBackend.Controllers
         }
 
         [HttpGet("currentdatetime")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
         public IActionResult GetCurrentDateTime()
         {
-            return Ok(DateTime.Now);
+            return Ok(new { 
+                currentDateTime = DateTime.Now,
+                serverTimeZone = TimeZoneId,
+                username = GetUsername(),
+                userId = GetUserId(),
+                authenticated = true
+            });
         }
 
-        // Get station information by station code
+        // Get station information by station code (REQUIRES ViewStations permission)
         [HttpGet("getstationname")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ViewStations)]
         public IActionResult GetStationName([FromQuery] StationRequest request)
         {
             // Automatic model validation
@@ -170,8 +180,10 @@ namespace FrtAfcBackend.Controllers
             }
         }
 
-        // Get fare between two stations
+        // Get fare between two stations (REQUIRES ViewFares permission)
         [HttpGet("fare")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ViewFares)]
         public IActionResult GetFare([FromQuery] FareRequest request)
         {
             // Automatic model validation
@@ -253,28 +265,244 @@ namespace FrtAfcBackend.Controllers
             }
         }
 
-        // Ticket issuance function
-        [HttpPost("issueticket")]
-        public IActionResult IssueTicket([FromBody] TicketRequest request)
+        // Issue full fare ticket (REQUIRES IssueFullFareTickets permission)
+        [HttpPost("issueticket/full")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.IssueFullFareTickets)]
+        public IActionResult IssueFullFareTicket([FromBody] TicketRequest request)
         {
-            // Automatic model validation
             if (!ModelState.IsValid)
-            {
                 return BadRequest(ModelState);
-            }
 
             try
             {
-                var ticketData = IssueTicketInternal(
-                    request.ValueCents,
-                    request.IssuingStation!,
-                    (byte)request.TicketType);
-
+                var ticketData = IssueTicketInternal(request.ValueCents, request.IssuingStation!, 0); // Type 0 = Full Fare
                 return Ok(ticketData);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Ticket issuance failed: {ex.Message}");
+                return StatusCode(500, $"Full fare ticket issuance failed: {ex.Message}");
+            }
+        }
+
+        // Issue student ticket (REQUIRES IssueStudentTickets permission)
+        [HttpPost("issueticket/student")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.IssueStudentTickets)]
+        public IActionResult IssueStudentTicket([FromBody] TicketRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                var ticketData = IssueTicketInternal(request.ValueCents, request.IssuingStation!, 1); // Type 1 = Student
+                return Ok(ticketData);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Student ticket issuance failed: {ex.Message}");
+            }
+        }
+
+        // Issue senior ticket (REQUIRES IssueSeniorTickets permission)
+        [HttpPost("issueticket/senior")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.IssueSeniorTickets)]
+        public IActionResult IssueSeniorTicket([FromBody] TicketRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                var ticketData = IssueTicketInternal(request.ValueCents, request.IssuingStation!, 2); // Type 2 = Senior
+                return Ok(ticketData);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Senior ticket issuance failed: {ex.Message}");
+            }
+        }
+
+        // Issue free entry ticket (REQUIRES IssueFreeEntryTickets permission)
+        [HttpPost("issueticket/free")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.IssueFreeEntryTickets)]
+        public IActionResult IssueFreeEntryTicket([FromBody] TicketRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                var ticketData = IssueTicketInternal(0, request.IssuingStation!, 3); // Type 3 = Free Entry, Value = 0
+                return Ok(ticketData);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Free entry ticket issuance failed: {ex.Message}");
+            }
+        }
+
+        // Issue day pass ticket (REQUIRES IssueDayPassTickets permission)
+        [HttpPost("issueticket/daypass")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.IssueDayPassTickets)]
+        public IActionResult IssueDayPassTicket([FromBody] TicketRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                var ticketData = IssueTicketInternal(request.ValueCents, request.IssuingStation!, 4); // Type 4 = Day Pass
+                return Ok(ticketData);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Day pass ticket issuance failed: {ex.Message}");
+            }
+        }
+
+        // Reissue damaged ticket (REQUIRES ReissueTickets permission)
+        [HttpPost("reissueticket")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ReissueTickets)]
+        public IActionResult ReissueTicket([FromBody] ReissueTicketRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                // TODO: Implement ticket lookup and validation logic
+                // For now, issue a replacement ticket with the same details
+                var ticketData = IssueTicketInternal(request.ValueCents, request.IssuingStation!, request.TicketType);
+                return Ok(new { 
+                    originalTicket = request.OriginalTicketNumber,
+                    replacementTicket = ticketData 
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Ticket reissuance failed: {ex.Message}");
+            }
+        }
+
+        // View ticket information (REQUIRES ViewTickets permission)
+        [HttpGet("ticket/{ticketNumber}")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ViewTickets)]
+        public IActionResult GetTicketInfo(string ticketNumber)
+        {
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var cmd = new SqlCommand(@"
+                    SELECT TicketNumber, ValueCents, IssuingStation, IssueDateTime, TicketType, TicketState
+                    FROM Tickets 
+                    WHERE TicketNumber = @ticketNumber", connection);
+
+                cmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
+
+                using var reader = cmd.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return NotFound($"Ticket '{ticketNumber}' not found");
+                }
+
+                var ticketInfo = new
+                {
+                    ticketNumber = reader.GetInt64("TicketNumber"),
+                    valueCents = reader.GetInt32("ValueCents"),
+                    issuingStation = reader.GetString("IssuingStation"),
+                    issueDateTime = reader.GetDateTime("IssueDateTime"),
+                    ticketType = reader.GetByte("TicketType"),
+                    ticketState = reader.GetByte("TicketState")
+                };
+
+                return Ok(ticketInfo);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Ticket lookup failed: {ex.Message}");
+            }
+        }
+
+        // Validate ticket at faregate (REQUIRES ValidateTickets permission)
+        [HttpPost("validateticket")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ValidateTickets)]
+        public IActionResult ValidateTicket([FromBody] ValidateTicketRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var transaction = connection.BeginTransaction();
+
+                // Update ticket state to "Used"
+                using var cmd = new SqlCommand(@"
+                    UPDATE Tickets 
+                    SET TicketState = 2, UsedDateTime = GETUTCDATE() 
+                    WHERE TicketNumber = @ticketNumber AND TicketState = 1", connection, transaction);
+
+                cmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+
+                var rowsAffected = cmd.ExecuteNonQuery();
+                if (rowsAffected == 0)
+                {
+                    transaction.Rollback();
+                    return BadRequest("Ticket not found or already used");
+                }
+
+                transaction.Commit();
+
+                return Ok(new { 
+                    ticketNumber = request.TicketNumber,
+                    status = "validated",
+                    validationTime = DateTime.UtcNow 
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Ticket validation failed: {ex.Message}");
+            }
+        }
+
+        // Change own password (REQUIRES ChangePassword permission)
+        [HttpPost("changepassword")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ChangePassword)]
+        public IActionResult ChangePassword([FromBody] ChangePasswordRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                var userId = GetUserId();
+                var success = ApiUserManager.UpdatePasswordAsync(userId, request.NewPassword).Result;
+                
+                if (success)
+                {
+                    return Ok(new { message = "Password changed successfully" });
+                }
+                else
+                {
+                    return BadRequest("Failed to change password");
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Password change failed: {ex.Message}");
             }
         }
 
@@ -310,26 +538,77 @@ namespace FrtAfcBackend.Controllers
             cmd.ExecuteNonQuery();
         }
 
-        [HttpGet("issuedebugticket")]
-        public IActionResult IssueDebugTicket()
+        // Get user's permission information (renamed method to avoid conflict)
+        [HttpGet("permissions")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        public IActionResult GetCurrentUserPermissions()
         {
-            if (!_debugMode)
-            {
-                return StatusCode(403, "Debug mode is not enabled");
-            }
+            var permissions = GetUserPermissions(); // This calls the base class method
+            var permissionNames = PermissionHelper.GetPermissionNames(permissions);
 
+            return Ok(new
+            {
+                username = GetUsername(),
+                userId = GetUserId(),
+                permissionValue = permissions,
+                permissions = permissionNames,
+                canViewStations = HasPermission(ApiPermissions.ViewStations),
+                canViewFares = HasPermission(ApiPermissions.ViewFares),
+                canIssueFullFare = HasPermission(ApiPermissions.IssueFullFareTickets),
+                canIssueStudent = HasPermission(ApiPermissions.IssueStudentTickets),
+                canIssueSenior = HasPermission(ApiPermissions.IssueSeniorTickets),
+                canIssueFree = HasPermission(ApiPermissions.IssueFreeEntryTickets),
+                canIssueDayPass = HasPermission(ApiPermissions.IssueDayPassTickets),
+                canReissue = HasPermission(ApiPermissions.ReissueTickets),
+                canViewTickets = HasPermission(ApiPermissions.ViewTickets),
+                canValidateTickets = HasPermission(ApiPermissions.ValidateTickets),
+                canChangePassword = HasPermission(ApiPermissions.ChangePassword),
+                isSystemAdmin = HasPermission(ApiPermissions.SystemAdmin)
+            });
+        }
+
+        // Get all stations (REQUIRES ViewStations permission)
+        [HttpGet("stations")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ViewStations)]
+        public IActionResult GetAllStations()
+        {
             try
             {
-                var ticketData = IssueTicketInternal(
-                    300,    // Fixed debug value
-                    "JLL",  // 俊霖路 station code
-                    255);   // Debug ticket type
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
 
-                return Ok(ticketData);
+                using var cmd = new SqlCommand(@"
+                    SELECT 
+                        StationCode,
+                        EnglishStationName,
+                        ChineseStationName,
+                        ZoneID,
+                        IsActive
+                    FROM Stations 
+                    ORDER BY StationCode", connection);
+
+                var stations = new List<StationInfo>();
+
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var stationInfo = new StationInfo
+                    {
+                        StationCode = reader.GetString("StationCode"),
+                        EnglishName = reader.GetString("EnglishStationName"),
+                        ChineseName = reader.GetString("ChineseStationName"),
+                        ZoneId = reader.GetInt32("ZoneID"),
+                        IsActive = reader.GetBoolean("IsActive")
+                    };
+                    stations.Add(stationInfo);
+                }
+
+                return Ok(stations);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Debug ticket issuance failed: {ex.Message}");
+                return StatusCode(500, $"Station list retrieval failed: {ex.Message}");
             }
         }
     }
@@ -363,11 +642,37 @@ namespace FrtAfcBackend.Controllers
         public required string IssuingStation { get; set; }
 
         [Required(ErrorMessage = "Ticket value is required")]
-        [Range(1, 100000, ErrorMessage = "Value must be between 1 and 100000 cents")]
+        [Range(0, 100000, ErrorMessage = "Value must be between 0 and 100000 cents")]
         public required int ValueCents { get; set; }
+    }
+
+    public class ReissueTicketRequest : TicketRequest
+    {
+        [Required(ErrorMessage = "Original ticket number is required")]
+        public required string OriginalTicketNumber { get; set; }
 
         [Required(ErrorMessage = "Ticket type is required")]
         [Range(0, 255, ErrorMessage = "Ticket type must be between 0 and 255")]
-        public required int TicketType { get; set; }
+        public required byte TicketType { get; set; }
+    }
+
+    public class ValidateTicketRequest
+    {
+        [Required(ErrorMessage = "Ticket number is required")]
+        public required string TicketNumber { get; set; }
+
+        [StringLength(3, MinimumLength = 3, ErrorMessage = "Station code must be 3 characters")]
+        [RegularExpression(@"^[A-Z]+$", ErrorMessage = "Station code must be uppercase letters")]
+        public string? ValidatingStation { get; set; }
+    }
+
+    public class ChangePasswordRequest
+    {
+        [Required(ErrorMessage = "Current password is required")]
+        public required string CurrentPassword { get; set; }
+
+        [Required(ErrorMessage = "New password is required")]
+        [MinLength(8, ErrorMessage = "New password must be at least 8 characters")]
+        public required string NewPassword { get; set; }
     }
 }
