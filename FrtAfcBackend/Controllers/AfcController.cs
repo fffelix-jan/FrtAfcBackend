@@ -611,6 +611,27 @@ namespace FrtAfcBackend.Controllers
                 return StatusCode(500, $"Station list retrieval failed: {ex.Message}");
             }
         }
+
+        // Issue debug ticket (only available in debug mode)
+        [HttpGet("issuedebugticket")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        public IActionResult IssueDebugTicket()
+        {
+            if (!_debugMode)
+            {
+                return StatusCode(403, "Debug mode is disabled");
+            }
+
+            try
+            {
+                var ticketData = IssueTicketInternal(999, "DBG", 255); // Type 255 = Debug
+                return Ok(ticketData);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Debug ticket issuance failed: {ex.Message}");
+            }
+        }
     }
 
     public class StationRequest

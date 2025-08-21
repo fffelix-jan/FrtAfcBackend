@@ -1,4 +1,8 @@
-﻿-- Create the database if it doesn't exist
+﻿-- Falloway Rapid Transit AFC Database Schema 0.2.0
+-- Changes:
+-- * fixed constraint so tickets table can be cleared directly
+
+-- Create the database if it doesn't exist
 IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = 'frtafc')
 BEGIN
     CREATE DATABASE frtafc;
@@ -67,10 +71,10 @@ CREATE TABLE FareRules (
     INDEX IX_FareRules_Zones (FromZone, ToZone)
 );
 
--- Ticket Audit Log
+-- Ticket Audit Log (completely independent)
 CREATE TABLE TicketAuditLog (
     AuditID BIGINT IDENTITY(1,1) PRIMARY KEY,
-    TicketID BIGINT NOT NULL,
+    TicketID BIGINT NULL, -- No longer references Tickets table
     TicketNumber BIGINT NOT NULL,
     ChangedBy NVARCHAR(128) NOT NULL DEFAULT SYSTEM_USER,
     ChangeType CHAR(1) NOT NULL CHECK (ChangeType IN ('I','U','D')),
@@ -82,6 +86,7 @@ CREATE TABLE TicketAuditLog (
     INDEX IX_AuditLog_DateTime (ChangeDateTime DESC),
     INDEX IX_AuditLog_Ticket (TicketID)
 );
+-- Note: No foreign key constraint is created for TicketAuditLog
 
 -- Users Table
 CREATE TABLE ApiUsers (
@@ -100,15 +105,9 @@ GO
 -- Create index for faster username lookups
 CREATE INDEX IX_ApiUsers_Username ON ApiUsers(Username);
 
--- Add foreign key to audit log after Tickets table exists
-ALTER TABLE TicketAuditLog
-ADD CONSTRAINT FK_Audit_Ticket 
-FOREIGN KEY (TicketID) REFERENCES Tickets(InternalTicketID);
-GO
-
 -- Now that all tables exist, create the stored procedures and triggers
-
--- Corrected audit trigger
+GO
+-- Corrected audit trigger (purely decorative)
 CREATE OR ALTER TRIGGER tr_Tickets_Audit
 ON Tickets
 AFTER INSERT, UPDATE, DELETE
