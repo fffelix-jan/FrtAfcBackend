@@ -197,67 +197,15 @@ namespace FrtAfcBackend.Controllers
                 using var connection = new SqlConnection(_connectionString);
                 connection.Open();
 
-                // Get station information and zones
-                using var cmd = new SqlCommand(@"
-                    SELECT 
-                        fs.StationCode as FromCode,
-                        fs.EnglishStationName as FromName,
-                        fs.ZoneID as FromZone,
-                        ts.StationCode as ToCode,
-                        ts.EnglishStationName as ToName,
-                        ts.ZoneID as ToZone
-                    FROM Stations fs
-                    CROSS JOIN Stations ts
-                    WHERE fs.StationCode = @fromStation 
-                      AND ts.StationCode = @toStation
-                      AND fs.IsActive = 1 
-                      AND ts.IsActive = 1", connection);
-
-                cmd.Parameters.AddWithValue("@fromStation", request.FromStation.ToUpper());
-                cmd.Parameters.AddWithValue("@toStation", request.ToStation.ToUpper());
-
-                using var reader = cmd.ExecuteReader();
-                if (!reader.Read())
+                // Use the shared helper method
+                var fareInfo = GetFareInfoInternal(connection, null, request.FromStation, request.ToStation);
+                
+                if (fareInfo == null)
                 {
-                    return NotFound("One or both station codes not found or inactive");
+                    return NotFound("One or both station codes not found or inactive, or no fare rule exists");
                 }
 
-                var fromZone = reader.GetInt32("FromZone");
-                var toZone = reader.GetInt32("ToZone");
-                var fromName = reader.GetString("FromName");
-                var toName = reader.GetString("ToName");
-
-                reader.Close();
-
-                // Get fare from FareRules table
-                using var fareCmd = new SqlCommand(@"
-                    SELECT FareCents 
-                    FROM FareRules 
-                    WHERE FromZone = @fromZone AND ToZone = @toZone", connection);
-
-                fareCmd.Parameters.AddWithValue("@fromZone", fromZone);
-                fareCmd.Parameters.AddWithValue("@toZone", toZone);
-
-                var fareResult = fareCmd.ExecuteScalar();
-                if (fareResult == null)
-                {
-                    return NotFound($"No fare rule found for zone {fromZone} to zone {toZone}");
-                }
-
-                var fareCents = Convert.ToInt32(fareResult);
-
-                var fareInfo = new FareInfo
-                {
-                    FromStation = request.FromStation.ToUpper(),
-                    ToStation = request.ToStation.ToUpper(),
-                    FromZone = fromZone,
-                    ToZone = toZone,
-                    FareCents = fareCents,
-                    FromStationName = fromName,
-                    ToStationName = toName
-                };
-
-                return Ok(fareInfo);
+                return Ok(fareInfo.Value);
             }
             catch (Exception ex)
             {
@@ -349,14 +297,17 @@ namespace FrtAfcBackend.Controllers
         [HttpPost("issueticket/daypass")]
         [Authorize(AuthenticationSchemes = "BasicAuthentication")]
         [RequirePermission(ApiPermissions.IssueDayPassTickets)]
-        public IActionResult IssueDayPassTicket([FromBody] TicketRequest request)
+        public IActionResult IssueDayPassTicket([FromBody] DayPassTicketRequest request)
         {
             if (!ModelState.IsValid)
                 return BadRequest(ModelState);
 
             try
             {
-                var ticketData = IssueTicketInternal(request.ValueCents, request.IssuingStation!, 4); // Type 4 = Day Pass
+                // Get current day pass price from database
+                int dayPassPrice = GetDayPassPriceCents();
+
+                var ticketData = IssueTicketInternal(dayPassPrice, request.IssuingStation!, 4);
                 return Ok(ticketData);
             }
             catch (Exception ex)
@@ -432,14 +383,20 @@ namespace FrtAfcBackend.Controllers
             }
         }
 
-        // Validate ticket at faregate (REQUIRES ValidateTickets permission)
-        [HttpPost("validateticket")]
+        // Validate ticket at entry faregate (REQUIRES ValidateTickets permission)
+        [HttpPost("validateticketatentry")]
         [Authorize(AuthenticationSchemes = "BasicAuthentication")]
         [RequirePermission(ApiPermissions.ValidateTickets)]
-        public IActionResult ValidateTicket([FromBody] ValidateTicketRequest request)
+        public IActionResult ValidateTicketAtEntry([FromBody] ValidateTicketRequest request)
         {
             if (!ModelState.IsValid)
                 return BadRequest(ModelState);
+
+            // ValidatingStation is required for entry validation
+            if (string.IsNullOrEmpty(request.ValidatingStation))
+            {
+                return BadRequest("Validating station is required for entry validation");
+            }
 
             try
             {
@@ -448,188 +405,303 @@ namespace FrtAfcBackend.Controllers
 
                 using var transaction = connection.BeginTransaction();
 
-                // Update ticket state to "Used"
-                using var cmd = new SqlCommand(@"
-                    UPDATE Tickets 
-                    SET TicketState = 2, UsedDateTime = GETUTCDATE() 
-                    WHERE TicketNumber = @ticketNumber AND TicketState = 1", connection, transaction);
+                // Get ticket information
+                using var ticketCmd = new SqlCommand(@"
+                    SELECT TicketNumber, ValueCents, IssuingStation, IssueDateTime, TicketType, TicketState
+                    FROM Tickets 
+                    WHERE TicketNumber = @ticketNumber", connection, transaction);
 
-                cmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+                ticketCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
 
-                var rowsAffected = cmd.ExecuteNonQuery();
-                if (rowsAffected == 0)
+                using var reader = ticketCmd.ExecuteReader();
+                if (!reader.Read())
                 {
                     transaction.Rollback();
-                    return BadRequest("Ticket not found or already used");
+                    return BadRequest("Ticket not found");
                 }
+
+                var ticketType = reader.GetByte("TicketType");
+                var ticketState = reader.GetByte("TicketState");
+                var issuingStation = reader.GetString("IssuingStation");
+                var issueDateTime = reader.GetDateTime("IssueDateTime");
+                var valueCents = reader.GetInt32("ValueCents");
+
+                reader.Close();
+
+                // Check ticket state
+                if (ticketState != 1)
+                {
+                    transaction.Rollback();
+                    return BadRequest("Ticket is not in valid state for entry");
+                }
+
+                // Handle different ticket types
+                switch (ticketType)
+                {
+                    case 3: // Free Exit ticket
+                        transaction.Rollback();
+                        return BadRequest("Free exit tickets cannot be used for entry");
+
+                    case 4: // Day Pass
+                        // Check if ticket is for current day
+                        var ticketDate = issueDateTime.Date;
+                        var currentDate = DateTime.Now.Date;
+                        
+                        if (ticketDate != currentDate)
+                        {
+                            transaction.Rollback();
+                            return BadRequest("Day pass is not valid for today");
+                        }
+                        break;
+
+                    default: // Regular tickets (0=Full, 1=Student, 2=Senior)
+                        // Check if issuing station matches validating station
+                        if (issuingStation.ToUpper() != request.ValidatingStation.ToUpper())
+                        {
+                            transaction.Rollback();
+                            return BadRequest($"Ticket issued at {issuingStation} cannot be used for entry at {request.ValidatingStation}");
+                        }
+                        break;
+                }
+
+                // Update ticket state to "Entered Station" (2)
+                using var updateCmd = new SqlCommand(@"
+                    UPDATE Tickets 
+                    SET TicketState = 2
+                    WHERE TicketNumber = @ticketNumber", connection, transaction);
+
+                updateCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+                updateCmd.ExecuteNonQuery();
 
                 transaction.Commit();
 
-                return Ok(new { 
+                return Ok(new
+                {
                     ticketNumber = request.TicketNumber,
-                    status = "validated",
-                    validationTime = DateTime.UtcNow 
+                    status = "entry_validated",
+                    validationTime = DateTime.UtcNow,
+                    ticketType = ticketType,
+                    issuingStation = issuingStation,
+                    validatingStation = request.ValidatingStation
                 });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Ticket validation failed: {ex.Message}");
+                return StatusCode(500, $"Entry ticket validation failed: {ex.Message}");
             }
         }
 
-        // Change own password (REQUIRES ChangePassword permission)
-        [HttpPost("changepassword")]
+        // Validate ticket at exit faregate (REQUIRES ValidateTickets permission)
+        [HttpPost("validateticketatexit")]
         [Authorize(AuthenticationSchemes = "BasicAuthentication")]
-        [RequirePermission(ApiPermissions.ChangePassword)]
-        public IActionResult ChangePassword([FromBody] ChangePasswordRequest request)
+        [RequirePermission(ApiPermissions.ValidateTickets)]
+        public IActionResult ValidateTicketAtExit([FromBody] ValidateTicketRequest request)
         {
             if (!ModelState.IsValid)
                 return BadRequest(ModelState);
 
-            try
+            // ValidatingStation is required for exit validation
+            if (string.IsNullOrEmpty(request.ValidatingStation))
             {
-                var userId = GetUserId();
-                var success = ApiUserManager.UpdatePasswordAsync(userId, request.NewPassword).Result;
-                
-                if (success)
-                {
-                    return Ok(new { message = "Password changed successfully" });
-                }
-                else
-                {
-                    return BadRequest("Failed to change password");
-                }
+                return BadRequest("Validating station is required for exit validation");
             }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Password change failed: {ex.Message}");
-            }
-        }
 
-        private void SaveTicket(
-            SqlConnection conn,
-            SqlTransaction tx,
-            long ticketNumber,
-            int valueCents,
-            string issuingStation,
-            byte ticketType,
-            string ticketString)
-        {
-            using var cmd = new SqlCommand(
-                @"INSERT INTO Tickets (
-                    TicketNumber,
-                    ValueCents,
-                    IssuingStation,
-                    IssueDateTime,
-                    TicketType,
-                    TicketState,
-                    IsInvoiced
-                ) VALUES (
-                    @num, @value, @station, 
-                    GETUTCDATE(), @type, 
-                    1, 0)", // State 1 = Paid, not used
-                conn, tx);
-
-            cmd.Parameters.AddWithValue("@num", ticketNumber);
-            cmd.Parameters.AddWithValue("@value", valueCents);
-            cmd.Parameters.AddWithValue("@station", issuingStation);
-            cmd.Parameters.AddWithValue("@type", ticketType);
-
-            cmd.ExecuteNonQuery();
-        }
-
-        // Get user's permission information (renamed method to avoid conflict)
-        [HttpGet("permissions")]
-        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
-        public IActionResult GetCurrentUserPermissions()
-        {
-            var permissions = GetUserPermissions(); // This calls the base class method
-            var permissionNames = PermissionHelper.GetPermissionNames(permissions);
-
-            return Ok(new
-            {
-                username = GetUsername(),
-                userId = GetUserId(),
-                permissionValue = permissions,
-                permissions = permissionNames,
-                canViewStations = HasPermission(ApiPermissions.ViewStations),
-                canViewFares = HasPermission(ApiPermissions.ViewFares),
-                canIssueFullFare = HasPermission(ApiPermissions.IssueFullFareTickets),
-                canIssueStudent = HasPermission(ApiPermissions.IssueStudentTickets),
-                canIssueSenior = HasPermission(ApiPermissions.IssueSeniorTickets),
-                canIssueFree = HasPermission(ApiPermissions.IssueFreeEntryTickets),
-                canIssueDayPass = HasPermission(ApiPermissions.IssueDayPassTickets),
-                canReissue = HasPermission(ApiPermissions.ReissueTickets),
-                canViewTickets = HasPermission(ApiPermissions.ViewTickets),
-                canValidateTickets = HasPermission(ApiPermissions.ValidateTickets),
-                canChangePassword = HasPermission(ApiPermissions.ChangePassword),
-                isSystemAdmin = HasPermission(ApiPermissions.SystemAdmin)
-            });
-        }
-
-        // Get all stations (REQUIRES ViewStations permission)
-        [HttpGet("stations")]
-        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
-        [RequirePermission(ApiPermissions.ViewStations)]
-        public IActionResult GetAllStations()
-        {
             try
             {
                 using var connection = new SqlConnection(_connectionString);
                 connection.Open();
 
-                using var cmd = new SqlCommand(@"
-                    SELECT 
-                        StationCode,
-                        EnglishStationName,
-                        ChineseStationName,
-                        ZoneID,
-                        IsActive
-                    FROM Stations 
-                    ORDER BY StationCode", connection);
+                using var transaction = connection.BeginTransaction();
 
-                var stations = new List<StationInfo>();
+                // Get ticket information
+                using var ticketCmd = new SqlCommand(@"
+                    SELECT TicketNumber, ValueCents, IssuingStation, IssueDateTime, TicketType, TicketState
+                    FROM Tickets 
+                    WHERE TicketNumber = @ticketNumber", connection, transaction);
 
-                using var reader = cmd.ExecuteReader();
-                while (reader.Read())
+                ticketCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+
+                using var reader = ticketCmd.ExecuteReader();
+                if (!reader.Read())
                 {
-                    var stationInfo = new StationInfo
-                    {
-                        StationCode = reader.GetString("StationCode"),
-                        EnglishName = reader.GetString("EnglishStationName"),
-                        ChineseName = reader.GetString("ChineseStationName"),
-                        ZoneId = reader.GetInt32("ZoneID"),
-                        IsActive = reader.GetBoolean("IsActive")
-                    };
-                    stations.Add(stationInfo);
+                    transaction.Rollback();
+                    return BadRequest("Ticket not found");
                 }
 
-                return Ok(stations);
+                var ticketType = reader.GetByte("TicketType");
+                var ticketState = reader.GetByte("TicketState");
+                var issuingStation = reader.GetString("IssuingStation");
+                var issueDateTime = reader.GetDateTime("IssueDateTime");
+                var valueCents = reader.GetInt32("ValueCents");
+
+                reader.Close();
+
+                // Check ticket state (allow 1=Paid or 2=Entered)
+                if (ticketState != 1 && ticketState != 2)
+                {
+                    transaction.Rollback();
+                    return BadRequest("Ticket is not in valid state for exit");
+                }
+
+                int newTicketState = 3; // Default: Exited Station
+
+                // Handle different ticket types
+                switch (ticketType)
+                {
+                    case 3: // Free Exit ticket
+                        // Free exit tickets can only be used at issuing station
+                        if (issuingStation.ToUpper() != request.ValidatingStation.ToUpper())
+                        {
+                            transaction.Rollback();
+                            return BadRequest($"Free exit ticket issued at {issuingStation} can only be used at {issuingStation}");
+                        }
+                        break;
+
+                    case 4: // Day Pass
+                        // Check if ticket is for current day
+                        var ticketDate = issueDateTime.Date;
+                        var currentDate = DateTime.Now.Date;
+                        
+                        if (ticketDate != currentDate)
+                        {
+                            transaction.Rollback();
+                            return BadRequest("Day pass is not valid for today");
+                        }
+                        
+                        // Day pass: set state back to 1 (reusable)
+                        newTicketState = 1;
+                        break;
+
+                    default: // Regular tickets (0=Full, 1=Student, 2=Senior)
+                        // Calculate required fare from issuing station to exit station
+                        var fareInfo = GetFareInfoInternal(connection, transaction, issuingStation, request.ValidatingStation);
+                        if (fareInfo == null)
+                        {
+                            transaction.Rollback();
+                            return BadRequest($"No fare rule found from {issuingStation} to {request.ValidatingStation}");
+                        }
+
+                        int requiredFare = fareInfo.Value.FareCents;
+
+                        // Apply discounts based on ticket type
+                        switch (ticketType)
+                        {
+                            case 1: // Student - 25% discount
+                                requiredFare = (int)(requiredFare * 0.75);
+                                break;
+                            case 2: // Senior - 50% discount
+                                requiredFare = (int)(requiredFare * 0.50);
+                                break;
+                            // case 0: Full fare - no discount
+                        }
+
+                        // Check if ticket has sufficient value
+                        if (valueCents < requiredFare)
+                        {
+                            transaction.Rollback();
+                            return BadRequest($"Insufficient fare: ticket value {valueCents} cents, required {requiredFare} cents");
+                        }
+                        break;
+                }
+
+                // Update ticket state
+                using var updateCmd = new SqlCommand(@"
+                    UPDATE Tickets 
+                    SET TicketState = @newState
+                    WHERE TicketNumber = @ticketNumber", connection, transaction);
+
+                updateCmd.Parameters.AddWithValue("@newState", newTicketState);
+                updateCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+                updateCmd.ExecuteNonQuery();
+
+                transaction.Commit();
+
+                return Ok(new
+                {
+                    ticketNumber = request.TicketNumber,
+                    status = newTicketState == 1 ? "exit_validated_reusable" : "exit_validated",
+                    validationTime = DateTime.UtcNow,
+                    ticketType = ticketType,
+                    issuingStation = issuingStation,
+                    validatingStation = request.ValidatingStation,
+                    newTicketState = newTicketState
+                });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Station list retrieval failed: {ex.Message}");
+                return StatusCode(500, $"Exit ticket validation failed: {ex.Message}");
             }
         }
 
-        // Issue debug ticket (only available in debug mode)
-        [HttpGet("issuedebugticket")]
-        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
-        public IActionResult IssueDebugTicket()
+        // Helper method to get fare information internally (shared between GetFare and validation methods)
+        [NonAction]
+        private FareInfo? GetFareInfoInternal(SqlConnection connection, SqlTransaction? transaction, string fromStation, string toStation)
         {
-            if (!_debugMode)
-            {
-                return StatusCode(403, "Debug mode is disabled");
-            }
-
             try
             {
-                var ticketData = IssueTicketInternal(999, "DBG", 255); // Type 255 = Debug
-                return Ok(ticketData);
+                // Get station information and zones
+                using var cmd = new SqlCommand(@"
+                    SELECT 
+                        fs.StationCode as FromCode,
+                        fs.EnglishStationName as FromName,
+                        fs.ZoneID as FromZone,
+                        ts.StationCode as ToCode,
+                        ts.EnglishStationName as ToName,
+                        ts.ZoneID as ToZone
+                    FROM Stations fs
+                    CROSS JOIN Stations ts
+                    WHERE fs.StationCode = @fromStation 
+                      AND ts.StationCode = @toStation
+                      AND fs.IsActive = 1 
+                      AND ts.IsActive = 1", connection, transaction);
+
+                cmd.Parameters.AddWithValue("@fromStation", fromStation.ToUpper());
+                cmd.Parameters.AddWithValue("@toStation", toStation.ToUpper());
+
+                using var reader = cmd.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return null;
+                }
+
+                var fromZone = reader.GetInt32("FromZone");
+                var toZone = reader.GetInt32("ToZone");
+                var fromName = reader.GetString("FromName");
+                var toName = reader.GetString("ToName");
+
+                reader.Close();
+
+                // Get fare from FareRules table
+                using var fareCmd = new SqlCommand(@"
+                    SELECT FareCents 
+                    FROM FareRules 
+                    WHERE FromZone = @fromZone AND ToZone = @toZone", connection, transaction);
+
+                fareCmd.Parameters.AddWithValue("@fromZone", fromZone);
+                fareCmd.Parameters.AddWithValue("@toZone", toZone);
+
+                var fareResult = fareCmd.ExecuteScalar();
+                if (fareResult == null)
+                {
+                    return null;
+                }
+
+                var fareCents = Convert.ToInt32(fareResult);
+
+                return new FareInfo
+                {
+                    FromStation = fromStation.ToUpper(),
+                    ToStation = toStation.ToUpper(),
+                    FromZone = fromZone,
+                    ToZone = toZone,
+                    FareCents = fareCents,
+                    FromStationName = fromName,
+                    ToStationName = toName
+                };
             }
-            catch (Exception ex)
+            catch
             {
-                return StatusCode(500, $"Debug ticket issuance failed: {ex.Message}");
+                return null;
             }
         }
     }
@@ -695,5 +767,20 @@ namespace FrtAfcBackend.Controllers
         [Required(ErrorMessage = "New password is required")]
         [MinLength(8, ErrorMessage = "New password must be at least 8 characters")]
         public required string NewPassword { get; set; }
+    }
+
+    public class UpdateDayPassPriceRequest
+    {
+        [Required(ErrorMessage = "Price in cents is required")]
+        [Range(0, 100000, ErrorMessage = "Price must be between 0 and 100000 cents")]
+        public required int PriceCents { get; set; }
+    }
+
+    public class DayPassTicketRequest
+    {
+        [Required(ErrorMessage = "Issuing station is required")]
+        [StringLength(3, MinimumLength = 3, ErrorMessage = "Station code must be 3 characters")]
+        [RegularExpression(@"^[A-Z]+$", ErrorMessage = "Station code must be uppercase letters")]
+        public required string IssuingStation { get; set; }
     }
 }

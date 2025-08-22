@@ -1,6 +1,7 @@
+using Microsoft.Data.SqlClient;
+using System.Data;
 using System.Security.Cryptography;
 using System.Text;
-using Microsoft.Data.SqlClient;
 
 namespace FrtAfcBackend
 {
@@ -63,6 +64,51 @@ namespace FrtAfcBackend
             using var pbkdf2 = new Rfc2898DeriveBytes(password, salt, 10000, HashAlgorithmName.SHA256);
             var hash = pbkdf2.GetBytes(64); // 64 bytes = 512 bits
             return Convert.ToBase64String(hash);
+        }
+
+        /// <summary>
+        /// Verifies a user's password against the stored hash
+        /// </summary>
+        /// <param name="username">Username to verify</param>
+        /// <param name="password">Plain text password to verify</param>
+        /// <returns>True if password is correct, false otherwise</returns>
+        public static async Task<bool> VerifyPasswordAsync(string username, string password)
+        {
+            if (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password))
+                return false;
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                await connection.OpenAsync();
+
+                using var cmd = new SqlCommand(@"
+                    SELECT PasswordHash, Salt 
+                    FROM ApiUsers 
+                    WHERE Username = @username AND IsActive = 1", connection);
+
+                cmd.Parameters.AddWithValue("@username", username);
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                if (!await reader.ReadAsync())
+                {
+                    return false; // User not found or inactive
+                }
+
+                var storedPasswordHash = reader.GetString("PasswordHash");
+                var storedSaltBase64 = reader.GetString("Salt");
+                var storedSalt = Convert.FromBase64String(storedSaltBase64);
+
+                // Hash the provided password with the stored salt
+                var computedHash = HashPassword(password, storedSalt);
+
+                // Compare the computed hash with the stored hash
+                return computedHash == storedPasswordHash;
+            }
+            catch
+            {
+                return false; // Return false on any error for security
+            }
         }
     }
 }

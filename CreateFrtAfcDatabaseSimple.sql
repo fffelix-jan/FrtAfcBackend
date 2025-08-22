@@ -45,6 +45,12 @@ CREATE TABLE ObfuscatingKeys (
 );
 
 -- Tickets Table
+/* Ticket States:
+0 - Unpaid
+1 - Paid
+2 - Entered Station
+3 - Exited Station (used)
+*/
 CREATE TABLE Tickets (
     InternalTicketID BIGINT IDENTITY(1,1) PRIMARY KEY,
     TicketNumber BIGINT NOT NULL UNIQUE,
@@ -104,6 +110,21 @@ GO
 
 -- Create index for faster username lookups
 CREATE INDEX IX_ApiUsers_Username ON ApiUsers(Username);
+GO
+
+-- Create integer variables table
+CREATE TABLE SystemIntegerVariables (
+	SettingKey VARCHAR(50) NOT NULL PRIMARY KEY,
+	SettingValue INT NOT NULL,
+	SettingDescription NVARCHAR(100) NULL,
+	LastUpdated DATETIME2 DEFAULT GETUTCDATE(),
+	UpdatedBy NVARCHAR(100) NULL
+);
+GO
+
+-- Add current day pass price in cents
+INSERT INTO SystemIntegerVariables (SettingKey, SettingValue, SettingDescription) 
+VALUES ('DayPassPriceCents', 1000, 'Current day pass price in cents');
 
 -- Now that all tables exist, create the stored procedures and triggers
 GO

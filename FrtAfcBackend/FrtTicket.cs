@@ -5,7 +5,7 @@ using K4os.Compression.LZ4;
 using Microsoft.Data.SqlClient;
 
 /// <summary>
-/// FrtTicket 0.1.0
+/// FrtTicket 0.1.1
 /// Provides methods for encoding and decoding FRT (Falloway Rapid Transit) tickets
 /// with cryptographic signatures and obfuscation for QR code generation.
 /// </summary>
@@ -36,7 +36,7 @@ public static class FrtTicket
     ///   <item><description>0 - Full Fare</description></item>
     ///   <item><description>1 - Student</description></item>
     ///   <item><description>2 - Senior</description></item>
-    ///   <item><description>3 - Free Entry</description></item>
+    ///   <item><description>3 - Free Exit</description></item>
     ///   <item><description>4 - Day Pass</description></item>
     ///   <item><description>255 - Debug</description></item>
     /// </list>
