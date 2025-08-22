@@ -42,7 +42,7 @@ namespace FrtAfcBackend.Controllers
     public class AfcController : PermissionControllerBase
     {
         // Set this to false in production to disable debug ticket issuance and other stuff!!!!!
-        private readonly bool _debugMode = true;
+        private readonly bool _debugMode = false;
 
         private readonly string? _connectionString = Environment.GetEnvironmentVariable("SQLSERVER_CONNECTION_STRING");
         private const string TimeZoneId = "China Standard Time"; // Change to your metro's timezone
@@ -702,6 +702,287 @@ namespace FrtAfcBackend.Controllers
             catch
             {
                 return null;
+            }
+        }
+
+        // Helper method to save ticket to database
+        [NonAction]
+        private void SaveTicket(
+            SqlConnection conn,
+            SqlTransaction tx,
+            long ticketNumber,
+            int valueCents,
+            string issuingStation,
+            byte ticketType,
+            string ticketString)
+        {
+            using var cmd = new SqlCommand(
+                @"INSERT INTO Tickets (
+                    TicketNumber,
+                    ValueCents,
+                    IssuingStation,
+                    IssueDateTime,
+                    TicketType,
+                    TicketState,
+                    IsInvoiced
+                ) VALUES (
+                    @num, @value, @station, 
+                    GETUTCDATE(), @type, 
+                    1, 0)", // State 1 = Paid, not used
+                conn, tx);
+
+            cmd.Parameters.AddWithValue("@num", ticketNumber);
+            cmd.Parameters.AddWithValue("@value", valueCents);
+            cmd.Parameters.AddWithValue("@station", issuingStation);
+            cmd.Parameters.AddWithValue("@type", ticketType);
+
+            cmd.ExecuteNonQuery();
+        }
+
+        // Helper method to get day pass price for internal use
+        [NonAction]
+        private int GetDayPassPriceCents()
+        {
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var cmd = new SqlCommand(@"
+                    SELECT SettingValue 
+                    FROM SystemIntegerVariables 
+                    WHERE SettingKey = 'DayPassPriceCents'", connection);
+
+                var result = cmd.ExecuteScalar();
+                if (result != null)
+                {
+                    return (int)result;
+                }
+
+                // Default fallback price if not configured (¥10.00)
+                return 1000;
+            }
+            catch
+            {
+                // Default fallback price on error
+                return 1000;
+            }
+        }
+
+        // Get current day pass price (REQUIRES ViewFares permission)
+        [HttpGet("daypassprice")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ViewFares)]
+        public IActionResult GetDayPassPrice()
+        {
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var cmd = new SqlCommand(@"
+                    SELECT SettingValue, LastUpdated 
+                    FROM SystemIntegerVariables 
+                    WHERE SettingKey = 'DayPassPriceCents'", connection);
+
+                using var reader = cmd.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return NotFound("Day pass price not configured");
+                }
+
+                int priceCents = reader.GetInt32("SettingValue");
+                DateTime lastUpdated = reader.GetDateTime("LastUpdated");
+
+                return Ok(new
+                {
+                    dayPassPriceCents = priceCents,
+                    dayPassPriceYuan = priceCents / 100.0m,
+                    lastUpdated = lastUpdated
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Day pass price lookup failed: {ex.Message}");
+            }
+        }
+
+        // Update day pass price (REQUIRES SystemAdmin permission)
+        [HttpPost("daypassprice")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.SystemAdmin)]
+        public IActionResult UpdateDayPassPrice([FromBody] UpdateDayPassPriceRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var cmd = new SqlCommand(@"
+                    UPDATE SystemIntegerVariables 
+                    SET SettingValue = @newPrice, 
+                        LastUpdated = GETUTCDATE(),
+                        UpdatedBy = @updatedBy
+                    WHERE SettingKey = 'DayPassPriceCents'", connection);
+
+                cmd.Parameters.AddWithValue("@newPrice", request.PriceCents);
+                cmd.Parameters.AddWithValue("@updatedBy", GetUsername());
+
+                int rowsAffected = cmd.ExecuteNonQuery();
+                if (rowsAffected == 0)
+                {
+                    return NotFound("Day pass price setting not found");
+                }
+
+                return Ok(new
+                {
+                    message = "Day pass price updated successfully",
+                    newPriceCents = request.PriceCents,
+                    newPriceYuan = request.PriceCents / 100.0m,
+                    updatedBy = GetUsername(),
+                    updatedAt = DateTime.UtcNow
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Day pass price update failed: {ex.Message}");
+            }
+        }
+
+        // Get user's permission information (renamed method to avoid conflict)
+        [HttpGet("permissions")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        public IActionResult GetCurrentUserPermissions()
+        {
+            var permissions = GetUserPermissions(); // This calls the base class method
+            var permissionNames = PermissionHelper.GetPermissionNames(permissions);
+
+            return Ok(new
+            {
+                username = GetUsername(),
+                userId = GetUserId(),
+                permissionValue = permissions,
+                permissions = permissionNames,
+                canViewStations = HasPermission(ApiPermissions.ViewStations),
+                canViewFares = HasPermission(ApiPermissions.ViewFares),
+                canIssueFullFare = HasPermission(ApiPermissions.IssueFullFareTickets),
+                canIssueStudent = HasPermission(ApiPermissions.IssueStudentTickets),
+                canIssueSenior = HasPermission(ApiPermissions.IssueSeniorTickets),
+                canIssueFree = HasPermission(ApiPermissions.IssueFreeEntryTickets),
+                canIssueDayPass = HasPermission(ApiPermissions.IssueDayPassTickets),
+                canReissue = HasPermission(ApiPermissions.ReissueTickets),
+                canViewTickets = HasPermission(ApiPermissions.ViewTickets),
+                canValidateTickets = HasPermission(ApiPermissions.ValidateTickets),
+                canChangePassword = HasPermission(ApiPermissions.ChangePassword),
+                isSystemAdmin = HasPermission(ApiPermissions.SystemAdmin)
+            });
+        }
+
+        // Get all stations (REQUIRES ViewStations permission)
+        [HttpGet("stations")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ViewStations)]
+        public IActionResult GetAllStations()
+        {
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var cmd = new SqlCommand(@"
+                    SELECT 
+                        StationCode,
+                        EnglishStationName,
+                        ChineseStationName,
+                        ZoneID,
+                        IsActive
+                    FROM Stations 
+                    ORDER BY StationCode", connection);
+
+                var stations = new List<StationInfo>();
+
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var stationInfo = new StationInfo
+                    {
+                        StationCode = reader.GetString("StationCode"),
+                        EnglishName = reader.GetString("EnglishStationName"),
+                        ChineseName = reader.GetString("ChineseStationName"),
+                        ZoneId = reader.GetInt32("ZoneID"),
+                        IsActive = reader.GetBoolean("IsActive")
+                    };
+                    stations.Add(stationInfo);
+                }
+
+                return Ok(stations);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Station list retrieval failed: {ex.Message}");
+            }
+        }
+
+        // Issue debug ticket (only available in debug mode)
+        [HttpGet("issuedebugticket")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        public IActionResult IssueDebugTicket()
+        {
+            if (!_debugMode)
+            {
+                return StatusCode(403, "Debug mode is disabled");
+            }
+
+            try
+            {
+                var ticketData = IssueTicketInternal(999, "DBG", 255); // Type 255 = Debug
+                return Ok(ticketData);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Debug ticket issuance failed: {ex.Message}");
+            }
+        }
+
+        // Change own password (REQUIRES ChangePassword permission)
+        [HttpPost("changepassword")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.ChangePassword)]
+        public IActionResult ChangePassword([FromBody] ChangePasswordRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                var userId = GetUserId();
+                var username = GetUsername();
+        
+                // CRITICAL: Verify current password before changing
+                var currentPasswordValid = ApiUserManager.VerifyPasswordAsync(username, request.CurrentPassword).Result;
+                if (!currentPasswordValid)
+                {
+                    return BadRequest("Current password is incorrect");
+                }
+        
+                // Only proceed if current password is valid
+                var success = ApiUserManager.UpdatePasswordAsync(userId, request.NewPassword).Result;
+        
+                if (success)
+                {
+                    return Ok(new { message = "Password changed successfully" });
+                }
+                else
+                {
+                    return BadRequest("Failed to change password");
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Password change failed: {ex.Message}");
             }
         }
     }
