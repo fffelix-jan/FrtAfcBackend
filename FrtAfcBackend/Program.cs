@@ -32,12 +32,15 @@ namespace FrtAfcBackend
         // User permissions
         ChangePassword = 1 << 10,           // 0x0400 - Change own password
 
+        // Additional permissions
+        IssueInvoices = 1 << 11,          // 0x0800 - Issue invoices
+
         // System administration - ALL PERMISSIONS
         SystemAdmin = int.MaxValue,         // 0x7FFFFFFF - Full system administrator (ALL FLAGS SET)
         
         // Convenience combinations
         BasicUser = ViewStations | ViewFares | ViewTickets,                                    // Standard read-only user
-        TicketOperator = BasicUser | IssueFullFareTickets | IssueStudentTickets | IssueSeniorTickets | IssueFreeEntryTickets | IssueDayPassTickets | ReissueTickets | ValidateTickets | ChangePassword,                // Ticket sales operator
+        TicketOperator = BasicUser | IssueFullFareTickets | IssueStudentTickets | IssueSeniorTickets | IssueFreeEntryTickets | IssueDayPassTickets | ReissueTickets | ViewTickets | ValidateTickets | ChangePassword | IssueInvoices,                // Ticket sales operator
         TicketVendingMachine = BasicUser | IssueFullFareTickets,
         Faregate = BasicUser | ValidateTickets,
     }

@@ -327,17 +327,308 @@ namespace FrtAfcBackend.Controllers
 
             try
             {
-                // TODO: Implement ticket lookup and validation logic
-                // For now, issue a replacement ticket with the same details
-                var ticketData = IssueTicketInternal(request.ValueCents, request.IssuingStation!, request.TicketType);
-                return Ok(new { 
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var transaction = connection.BeginTransaction();
+
+                // 1. Validate the original ticket exists and get its details
+                using var validateCmd = new SqlCommand(@"
+                    SELECT TicketNumber, ValueCents, IssuingStation, TicketType, TicketState, IsInvoiced
+                    FROM Tickets 
+                    WHERE TicketNumber = @originalTicketNumber", connection, transaction);
+
+                validateCmd.Parameters.AddWithValue("@originalTicketNumber", request.OriginalTicketNumber);
+
+                using var reader = validateCmd.ExecuteReader();
+                if (!reader.Read())
+                {
+                    transaction.Rollback();
+                    return NotFound($"Original ticket '{request.OriginalTicketNumber}' not found");
+                }
+
+                var originalTicketState = reader.GetByte("TicketState");
+                var originalValueCents = reader.GetInt32("ValueCents");
+                var originalIssuingStation = reader.GetString("IssuingStation");
+                var originalTicketType = reader.GetByte("TicketType");
+                var originalIsInvoiced = reader.GetBoolean("IsInvoiced");
+
+                reader.Close();
+
+                // 2. Check if ticket is in a valid state for reissue (allow paid or entered station)
+                if (originalTicketState != 1 && originalTicketState != 2)
+                {
+                    transaction.Rollback();
+                    return BadRequest($"Ticket '{request.OriginalTicketNumber}' cannot be reissued (current state: {originalTicketState}). Only tickets in 'Paid' (1) or 'Entered Station' (2) states can be reissued.");
+                }
+
+                // 3. Use provided values or fall back to original ticket values (preserve original ticket type)
+                int newValueCents = request.ValueCents > 0 ? request.ValueCents : originalValueCents;
+                string newIssuingStation = !string.IsNullOrEmpty(request.IssuingStation) ? request.IssuingStation : originalIssuingStation;
+                byte newTicketType = originalTicketType; // Always use original ticket type
+
+                // 4. Generate new ticket number
+                long newTicketNumber = GenerateTicketNumberOnDB(connection, transaction);
+
+                // 5. Get cryptographic keys
+                var (signingKey, xorKey) = FrtTicket.GetCurrentKeys(connection, transaction);
+
+                // 6. Encode new ticket
+                string newTicketString = FrtTicket.EncodeTicket(
+                    ticketNumber: newTicketNumber,
+                    valueCents: newValueCents,
+                    issuingStation: newIssuingStation,
+                    issueDateTime: DateTime.UtcNow,
+                    ticketType: newTicketType,
+                    signingKey: signingKey,
+                    xorObfuscatorKey: xorKey);
+
+                // 7. Insert new ticket with same state, type, and invoice status as original
+                SaveTicketWithStateAndInvoice(connection, transaction,
+                    ticketNumber: newTicketNumber,
+                    valueCents: newValueCents,
+                    issuingStation: newIssuingStation,
+                    ticketType: newTicketType,
+                    ticketString: newTicketString,
+                    ticketState: originalTicketState,
+                    isInvoiced: originalIsInvoiced); // Preserve invoice status
+
+                // 8. Invalidate original ticket (set state to 4 = Reissued/Invalid)
+                using var invalidateCmd = new SqlCommand(@"
+                    UPDATE Tickets 
+                    SET TicketState = 4
+                    WHERE TicketNumber = @originalTicketNumber", connection, transaction);
+
+                invalidateCmd.Parameters.AddWithValue("@originalTicketNumber", request.OriginalTicketNumber);
+                invalidateCmd.ExecuteNonQuery();
+
+                transaction.Commit();
+
+                var newTicketData = new TicketData
+                {
+                    TicketString = newTicketString,
+                    TicketNumber = newTicketNumber.ToString(),
+                    IssueTime = DateTime.UtcNow
+                };
+
+                return Ok(new
+                {
                     originalTicket = request.OriginalTicketNumber,
-                    replacementTicket = ticketData 
+                    originalTicketState = originalTicketState,
+                    originalTicketType = originalTicketType,
+                    originalIssuingStation = originalIssuingStation,
+                    originalValueCents = originalValueCents, // Add this line
+                    originalIsInvoiced = originalIsInvoiced,
+                    replacementTicket = newTicketData,
+                    replacementTicketState = originalTicketState,
+                    replacementTicketType = originalTicketType,
+                    replacementValueCents = newValueCents, // Add this line
+                    replacementIsInvoiced = originalIsInvoiced,
+                    message = $"Ticket successfully reissued (original state: {originalTicketState}, type: {originalTicketType}, invoice status: {originalIsInvoiced} preserved)",
+                    reissuedBy = GetUsername(),
+                    reissueTime = DateTime.UtcNow
                 });
             }
             catch (Exception ex)
             {
                 return StatusCode(500, $"Ticket reissuance failed: {ex.Message}");
+            }
+        }
+
+        // Helper method to save ticket with specific state and invoice status
+        [NonAction]
+        private void SaveTicketWithStateAndInvoice(
+            SqlConnection conn,
+            SqlTransaction tx,
+            long ticketNumber,
+            int valueCents,
+            string issuingStation,
+            byte ticketType,
+            string ticketString,
+            byte ticketState,
+            bool isInvoiced)
+        {
+            using var cmd = new SqlCommand(
+                @"INSERT INTO Tickets (
+                    TicketNumber,
+                    ValueCents,
+                    IssuingStation,
+                    IssueDateTime,
+                    TicketType,
+                    TicketState,
+                    IsInvoiced
+                ) VALUES (
+                    @num, @value, @station, 
+                    GETUTCDATE(), @type, @state, @invoiced)",
+                conn, tx);
+
+            cmd.Parameters.AddWithValue("@num", ticketNumber);
+            cmd.Parameters.AddWithValue("@value", valueCents);
+            cmd.Parameters.AddWithValue("@station", issuingStation);
+            cmd.Parameters.AddWithValue("@type", ticketType);
+            cmd.Parameters.AddWithValue("@state", ticketState);
+            cmd.Parameters.AddWithValue("@invoiced", isInvoiced);
+
+            cmd.ExecuteNonQuery();
+        }
+
+        // Issue invoice for ticket (REQUIRES IssueInvoices permission)
+        [HttpPost("issueinvoice")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.IssueInvoices)]
+        public IActionResult IssueInvoice([FromBody] IssueInvoiceRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                using var transaction = connection.BeginTransaction();
+
+                string ticketNumber;
+
+                // Check if input is a QR code (ticket string) or ticket number
+                if (request.TicketInput.Length > 20) // QR codes are much longer than ticket numbers
+                {
+                    // Input is likely a QR code (ticket string), find the ticket number
+                    using var qrCmd = new SqlCommand(@"
+                        SELECT TicketNumber, ValueCents, IssuingStation, IssueDateTime, TicketType, TicketState, IsInvoiced
+                        FROM Tickets 
+                        WHERE TicketString = @ticketString", connection, transaction);
+
+                    qrCmd.Parameters.AddWithValue("@ticketString", request.TicketInput);
+
+                    using var qrReader = qrCmd.ExecuteReader();
+                    if (!qrReader.Read())
+                    {
+                        transaction.Rollback();
+                        return NotFound("Ticket with specified QR code not found");
+                    }
+
+                    ticketNumber = qrReader.GetInt64("TicketNumber").ToString();
+                    var isInvoiced = qrReader.GetBoolean("IsInvoiced");
+                    var ticketType = qrReader.GetByte("TicketType");
+                    var ticketState = qrReader.GetByte("TicketState");
+                    var valueCents = qrReader.GetInt32("ValueCents");
+                    var issuingStation = qrReader.GetString("IssuingStation");
+                    var issueDateTime = qrReader.GetDateTime("IssueDateTime");
+
+                    qrReader.Close();
+
+                    // Check if already invoiced
+                    if (isInvoiced)
+                    {
+                        transaction.Rollback();
+                        return BadRequest($"Ticket '{ticketNumber}' has already been invoiced");
+                    }
+
+                    // Check if ticket can be invoiced (only tickets with value > 0)
+                    if (valueCents <= 0)
+                    {
+                        transaction.Rollback();
+                        return BadRequest($"Cannot issue invoice for free tickets (value: ¥{valueCents / 100.0:F2})");
+                    }
+
+                    // Update invoice status
+                    using var updateCmd = new SqlCommand(@"
+                        UPDATE Tickets 
+                        SET IsInvoiced = 1
+                        WHERE TicketNumber = @ticketNumber", connection, transaction);
+
+                    updateCmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
+                    updateCmd.ExecuteNonQuery();
+
+                    transaction.Commit();
+
+                    return Ok(new
+                    {
+                        ticketNumber = ticketNumber,
+                        ticketType = ticketType,
+                        ticketState = ticketState,
+                        valueCents = valueCents,
+                        valueYuan = valueCents / 100.0m,
+                        issuingStation = issuingStation,
+                        issueDateTime = issueDateTime,
+                        invoicedBy = GetUsername(),
+                        invoiceTime = DateTime.UtcNow,
+                        message = $"Invoice issued successfully for ticket {ticketNumber}"
+                    });
+                }
+                else
+                {
+                    // Input is a ticket number
+                    ticketNumber = request.TicketInput;
+
+                    // Validate and get ticket information
+                    using var ticketCmd = new SqlCommand(@"
+                        SELECT TicketNumber, ValueCents, IssuingStation, IssueDateTime, TicketType, TicketState, IsInvoiced
+                        FROM Tickets 
+                        WHERE TicketNumber = @ticketNumber", connection, transaction);
+
+                    ticketCmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
+
+                    using var reader = ticketCmd.ExecuteReader();
+                    if (!reader.Read())
+                    {
+                        transaction.Rollback();
+                        return NotFound($"Ticket '{ticketNumber}' not found");
+                    }
+
+                    var isInvoiced = reader.GetBoolean("IsInvoiced");
+                    var ticketType = reader.GetByte("TicketType");
+                    var ticketState = reader.GetByte("TicketState");
+                    var valueCents = reader.GetInt32("ValueCents");
+                    var issuingStation = reader.GetString("IssuingStation");
+                    var issueDateTime = reader.GetDateTime("IssueDateTime");
+
+                    reader.Close();
+
+                    // Check if already invoiced
+                    if (isInvoiced)
+                    {
+                        transaction.Rollback();
+                        return BadRequest($"Ticket '{ticketNumber}' has already been invoiced");
+                    }
+
+                    // Check if ticket can be invoiced (only tickets with value > 0)
+                    if (valueCents <= 0)
+                    {
+                        transaction.Rollback();
+                        return BadRequest($"Cannot issue invoice for free tickets (value: ¥{valueCents / 100.0:F2})");
+                    }
+
+                    // Update invoice status
+                    using var updateCmd = new SqlCommand(@"
+                        UPDATE Tickets 
+                        SET IsInvoiced = 1
+                        WHERE TicketNumber = @ticketNumber", connection, transaction);
+
+                    updateCmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
+                    updateCmd.ExecuteNonQuery();
+
+                    transaction.Commit();
+
+                    return Ok(new
+                    {
+                        ticketNumber = ticketNumber,
+                        ticketType = ticketType,
+                        ticketState = ticketState,
+                        valueCents = valueCents,
+                        valueYuan = valueCents / 100.0m,
+                        issuingStation = issuingStation,
+                        issueDateTime = issueDateTime,
+                        invoicedBy = GetUsername(),
+                        invoiceTime = DateTime.UtcNow,
+                        message = $"Invoice issued successfully for ticket {ticketNumber}"
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Invoice issuance failed: {ex.Message}");
             }
         }
 
@@ -1024,10 +1315,6 @@ namespace FrtAfcBackend.Controllers
     {
         [Required(ErrorMessage = "Original ticket number is required")]
         public required string OriginalTicketNumber { get; set; }
-
-        [Required(ErrorMessage = "Ticket type is required")]
-        [Range(0, 255, ErrorMessage = "Ticket type must be between 0 and 255")]
-        public required byte TicketType { get; set; }
     }
 
     public class ValidateTicketRequest
@@ -1063,5 +1350,11 @@ namespace FrtAfcBackend.Controllers
         [StringLength(3, MinimumLength = 3, ErrorMessage = "Station code must be 3 characters")]
         [RegularExpression(@"^[A-Z]+$", ErrorMessage = "Station code must be uppercase letters")]
         public required string IssuingStation { get; set; }
+    }
+
+    public class IssueInvoiceRequest
+    {
+        [Required(ErrorMessage = "Ticket input is required")]
+        public required string TicketInput { get; set; }
     }
 }
