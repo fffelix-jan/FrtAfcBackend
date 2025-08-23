@@ -50,6 +50,8 @@ CREATE TABLE ObfuscatingKeys (
 1 - Paid
 2 - Entered Station
 3 - Exited Station (used)
+4 - Reissued/Invalid
+5 - Refunded
 */
 CREATE TABLE Tickets (
     InternalTicketID BIGINT IDENTITY(1,1) PRIMARY KEY,
