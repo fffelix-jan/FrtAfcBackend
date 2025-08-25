@@ -1104,6 +1104,70 @@ namespace FrtAfcBackend.Controllers
             }
         }
 
+        // Get the current day's signing keys (3 AM to 3 AM next day)
+        [HttpGet("currentdaykeys")]
+        [Authorize(AuthenticationSchemes = "BasicAuthentication")]
+        [RequirePermission(ApiPermissions.SystemAdmin)]
+        public IActionResult GetCurrentDaySigningKeys()
+        {
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                connection.Open();
+
+                // Determine the correct key window
+                var now = DateTime.UtcNow;
+                var tz = TimeZoneInfo.FindSystemTimeZoneById(TimeZoneId);
+                var localNow = TimeZoneInfo.ConvertTimeFromUtc(now, tz);
+
+                // Calculate 3 AM boundaries
+                DateTime start, end;
+                if (localNow.Hour < 3)
+                {
+                    // Between midnight and 3 AM: use previous day's 3 AM to current day's 3 AM
+                    var prevDay = localNow.Date.AddDays(-1);
+                    start = prevDay.AddHours(3);
+                    end = localNow.Date.AddHours(3);
+                }
+                else
+                {
+                    // Otherwise: use current day's 3 AM to next day's 3 AM
+                    start = localNow.Date.AddHours(3);
+                    end = localNow.Date.AddDays(1).AddHours(3);
+                }
+
+                // Query for the key created after start but before end
+                using var cmd = new SqlCommand(@"
+                    SELECT TOP 1 KeyVersion, KeyCreated, PublicKey, XorKey
+                    FROM SigningKeys
+                    WHERE KeyCreated >= @start AND KeyCreated < @end
+                    ORDER BY KeyCreated DESC", connection);
+
+                cmd.Parameters.AddWithValue("@start", start);
+                cmd.Parameters.AddWithValue("@end", end);
+
+                using var reader = cmd.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return NotFound("No signing key found for the current day window.");
+                }
+
+                var keyInfo = new
+                {
+                    KeyVersion = reader.GetInt32(reader.GetOrdinal("KeyVersion")),
+                    KeyCreated = reader.GetDateTime(reader.GetOrdinal("KeyCreated")),
+                    PublicKey = reader.GetString(reader.GetOrdinal("PublicKey")),
+                    XorKey = Convert.ToBase64String((byte[])reader["XorKey"])
+                };
+
+                return Ok(keyInfo);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Failed to get current day's signing keys: {ex.Message}");
+            }
+        }
+
         // Helper method to get fare information internally (shared between GetFare and validation methods)
         [NonAction]
         private FareInfo? GetFareInfoInternal(SqlConnection connection, SqlTransaction? transaction, string fromStation, string toStation)
