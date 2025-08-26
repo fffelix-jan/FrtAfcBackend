@@ -15,7 +15,7 @@ namespace BackendStressTestProgram
         private const string IssuingStation = "FLZ";
         private const int TicketType = 0; // Full fare
         private const int ValueCents = 200;
-        private const int Parallelism = 1000;
+        private const int Parallelism = 200;
         private const int TotalTickets = 10000;
 
         static async Task Main(string[] args)
@@ -108,6 +108,7 @@ namespace BackendStressTestProgram
                 Console.WriteLine($"Success: {successCount}");
                 Console.WriteLine($"Failed: {failCount}");
                 Console.WriteLine($"Total Time: {totalSw.Elapsed.TotalSeconds:F2} seconds");
+                Console.WriteLine($"Tickets Per Second: {(totalSw.Elapsed.TotalSeconds > 0 ? successCount / totalSw.Elapsed.TotalSeconds : 0):F2}");
                 Console.WriteLine($"Average Time per Request: {(timings.Count > 0 ? timings.Average() : 0):F2} ms");
                 Console.WriteLine($"Min Time: {(timings.Count > 0 ? timings.Min() : 0)} ms");
                 Console.WriteLine($"Max Time: {(timings.Count > 0 ? timings.Max() : 0)} ms");
