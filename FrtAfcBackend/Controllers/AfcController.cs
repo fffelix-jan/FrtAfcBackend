@@ -876,13 +876,67 @@ namespace FrtAfcBackend.Controllers
 
                 using var transaction = connection.BeginTransaction();
 
+                string ticketNumber;
+
+                // Check if input is a QR code (ticket string) or ticket number
+                if (request.TicketInput.Length > 20) // QR codes are much longer than ticket numbers
+                {
+                    // Input is likely a QR code (ticket string), decode it
+                    try
+                    {
+                        // Get cryptographic keys for decoding
+                        var (signingKey, xorKey) = FrtTicket.TryGetValidKeys(connection, transaction);
+                        if (signingKey == null || xorKey == null)
+                        {
+                            transaction.Rollback();
+                            return StatusCode(500, "Unable to retrieve decoding keys from server");
+                        }
+
+                        // Try to decode the QR code
+                        bool decoded = FrtTicket.TryDecodeTicket(
+                            encodedTicket: request.TicketInput,
+                            signingKey: signingKey,
+                            xorObfuscatorKey: xorKey,
+                            out long decodedTicketNumber,
+                            out int decodedValueCents,
+                            out string decodedIssuingStation,
+                            out DateTime decodedIssueDateTime,
+                            out byte decodedTicketType);
+
+                        if (!decoded)
+                        {
+                            transaction.Rollback();
+                            return BadRequest("Invalid QR code or unable to decode ticket");
+                        }
+
+                        ticketNumber = decodedTicketNumber.ToString();
+
+                        // Dispose the keys properly
+                        signingKey.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        transaction.Rollback();
+                        return BadRequest($"QR code decoding failed: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    // Validate ticket number format for manual input
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(request.TicketInput.Trim(), @"^\d+$"))
+                    {
+                        return BadRequest("Invalid ticket number format. Ticket number must contain only digits.");
+                    }
+                    ticketNumber = request.TicketInput.Trim();
+                }
+
                 // Get ticket information
                 using var ticketCmd = new SqlCommand(@"
                     SELECT TicketNumber, ValueCents, IssuingStation, IssueDateTime, TicketType, TicketState
                     FROM Tickets 
                     WHERE TicketNumber = @ticketNumber", connection, transaction);
 
-                ticketCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+                ticketCmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
 
                 using var reader = ticketCmd.ExecuteReader();
                 if (!reader.Read())
@@ -917,7 +971,7 @@ namespace FrtAfcBackend.Controllers
                         // Check if ticket is for current day
                         var ticketDate = issueDateTime.Date;
                         var currentDate = DateTime.Now.Date;
-                        
+
                         if (ticketDate != currentDate)
                         {
                             transaction.Rollback();
@@ -941,19 +995,20 @@ namespace FrtAfcBackend.Controllers
                     SET TicketState = 2
                     WHERE TicketNumber = @ticketNumber", connection, transaction);
 
-                updateCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+                updateCmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
                 updateCmd.ExecuteNonQuery();
 
                 transaction.Commit();
 
                 return Ok(new
                 {
-                    ticketNumber = request.TicketNumber,
+                    ticketNumber = ticketNumber,
                     status = "entry_validated",
                     validationTime = DateTime.UtcNow,
                     ticketType = ticketType,
                     issuingStation = issuingStation,
-                    validatingStation = request.ValidatingStation
+                    validatingStation = request.ValidatingStation,
+                    inputMethod = request.TicketInput.Length > 20 ? "qr_code" : "ticket_number"
                 });
             }
             catch (Exception ex)
@@ -984,13 +1039,67 @@ namespace FrtAfcBackend.Controllers
 
                 using var transaction = connection.BeginTransaction();
 
+                string ticketNumber;
+
+                // Check if input is a QR code (ticket string) or ticket number
+                if (request.TicketInput.Length > 20) // QR codes are much longer than ticket numbers
+                {
+                    // Input is likely a QR code (ticket string), decode it
+                    try
+                    {
+                        // Get cryptographic keys for decoding
+                        var (signingKey, xorKey) = FrtTicket.TryGetValidKeys(connection, transaction);
+                        if (signingKey == null || xorKey == null)
+                        {
+                            transaction.Rollback();
+                            return StatusCode(500, "Unable to retrieve decoding keys from server");
+                        }
+
+                        // Try to decode the QR code
+                        bool decoded = FrtTicket.TryDecodeTicket(
+                            encodedTicket: request.TicketInput,
+                            signingKey: signingKey,
+                            xorObfuscatorKey: xorKey,
+                            out long decodedTicketNumber,
+                            out int decodedValueCents,
+                            out string decodedIssuingStation,
+                            out DateTime decodedIssueDateTime,
+                            out byte decodedTicketType);
+
+                        if (!decoded)
+                        {
+                            transaction.Rollback();
+                            return BadRequest("Invalid QR code or unable to decode ticket");
+                        }
+
+                        ticketNumber = decodedTicketNumber.ToString();
+
+                        // Dispose the keys properly
+                        signingKey.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        transaction.Rollback();
+                        return BadRequest($"QR code decoding failed: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    // Validate ticket number format for manual input
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(request.TicketInput.Trim(), @"^\d+$"))
+                    {
+                        return BadRequest("Invalid ticket number format. Ticket number must contain only digits.");
+                    }
+                    ticketNumber = request.TicketInput.Trim();
+                }
+
                 // Get ticket information
                 using var ticketCmd = new SqlCommand(@"
                     SELECT TicketNumber, ValueCents, IssuingStation, IssueDateTime, TicketType, TicketState
                     FROM Tickets 
                     WHERE TicketNumber = @ticketNumber", connection, transaction);
 
-                ticketCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+                ticketCmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
 
                 using var reader = ticketCmd.ExecuteReader();
                 if (!reader.Read())
@@ -1032,13 +1141,13 @@ namespace FrtAfcBackend.Controllers
                         // Check if ticket is for current day
                         var ticketDate = issueDateTime.Date;
                         var currentDate = DateTime.Now.Date;
-                        
+
                         if (ticketDate != currentDate)
                         {
                             transaction.Rollback();
                             return BadRequest("Day pass is not valid for today");
                         }
-                        
+
                         // Day pass: set state back to 1 (reusable)
                         newTicketState = 1;
                         break;
@@ -1063,7 +1172,7 @@ namespace FrtAfcBackend.Controllers
                             case 2: // Senior - 50% discount
                                 requiredFare = (int)(requiredFare * 0.50);
                                 break;
-                            // case 0: Full fare - no discount
+                                // case 0: Full fare - no discount
                         }
 
                         // Check if ticket has sufficient value
@@ -1082,20 +1191,21 @@ namespace FrtAfcBackend.Controllers
                     WHERE TicketNumber = @ticketNumber", connection, transaction);
 
                 updateCmd.Parameters.AddWithValue("@newState", newTicketState);
-                updateCmd.Parameters.AddWithValue("@ticketNumber", request.TicketNumber);
+                updateCmd.Parameters.AddWithValue("@ticketNumber", ticketNumber);
                 updateCmd.ExecuteNonQuery();
 
                 transaction.Commit();
 
                 return Ok(new
                 {
-                    ticketNumber = request.TicketNumber,
+                    ticketNumber = ticketNumber,
                     status = newTicketState == 1 ? "exit_validated_reusable" : "exit_validated",
                     validationTime = DateTime.UtcNow,
                     ticketType = ticketType,
                     issuingStation = issuingStation,
                     validatingStation = request.ValidatingStation,
-                    newTicketState = newTicketState
+                    newTicketState = newTicketState,
+                    inputMethod = request.TicketInput.Length > 20 ? "qr_code" : "ticket_number"
                 });
             }
             catch (Exception ex)
@@ -1104,7 +1214,7 @@ namespace FrtAfcBackend.Controllers
             }
         }
 
-        // Get the current day's signing keys (3 AM to 3 AM next day)
+        // Get the current day's signing keys (3 AM to 3 AM next day) - NOW RETURNS ALL VALID KEYS
         [HttpGet("currentdaykeys")]
         [Authorize(AuthenticationSchemes = "BasicAuthentication")]
         [RequirePermission(ApiPermissions.SystemAdmin)]
@@ -1120,25 +1230,25 @@ namespace FrtAfcBackend.Controllers
                 var tz = TimeZoneInfo.FindSystemTimeZoneById(TimeZoneId);
                 var localNow = TimeZoneInfo.ConvertTimeFromUtc(now, tz);
 
-                // Calculate 3 AM boundaries
+                // Calculate 3 AM boundaries - extend the window to include previous day's keys
                 DateTime start, end;
                 if (localNow.Hour < 3)
                 {
-                    // Between midnight and 3 AM: use previous day's 3 AM to current day's 3 AM
+                    // Between midnight and 3 AM: get both previous day's and current day's keys
                     var prevDay = localNow.Date.AddDays(-1);
                     start = prevDay.AddHours(3);
                     end = localNow.Date.AddHours(3);
                 }
                 else
                 {
-                    // Otherwise: use current day's 3 AM to next day's 3 AM
+                    // Otherwise: get current day's and next day's keys (for overlap period)
                     start = localNow.Date.AddHours(3);
                     end = localNow.Date.AddDays(1).AddHours(3);
                 }
 
-                // Query for the key created after start but before end
+                // Query for ALL keys in the valid time window, ordered by creation time
                 using var cmd = new SqlCommand(@"
-                    SELECT TOP 1 KeyVersion, KeyCreated, PublicKey, XorKey
+                    SELECT KeyVersion, KeyCreated, PublicKey, XorKey
                     FROM SigningKeys
                     WHERE KeyCreated >= @start AND KeyCreated < @end
                     ORDER BY KeyCreated DESC", connection);
@@ -1146,21 +1256,27 @@ namespace FrtAfcBackend.Controllers
                 cmd.Parameters.AddWithValue("@start", start);
                 cmd.Parameters.AddWithValue("@end", end);
 
+                var signingKeys = new List<object>();
                 using var reader = cmd.ExecuteReader();
-                if (!reader.Read())
+                
+                while (reader.Read())
                 {
-                    return NotFound("No signing key found for the current day window.");
+                    var keyInfo = new
+                    {
+                        KeyVersion = reader.GetInt32(reader.GetOrdinal("KeyVersion")),
+                        KeyCreated = reader.GetDateTime(reader.GetOrdinal("KeyCreated")),
+                        PublicKey = reader.GetString(reader.GetOrdinal("PublicKey")),
+                        XorKey = Convert.ToBase64String((byte[])reader["XorKey"])
+                    };
+                    signingKeys.Add(keyInfo);
                 }
 
-                var keyInfo = new
+                if (signingKeys.Count == 0)
                 {
-                    KeyVersion = reader.GetInt32(reader.GetOrdinal("KeyVersion")),
-                    KeyCreated = reader.GetDateTime(reader.GetOrdinal("KeyCreated")),
-                    PublicKey = reader.GetString(reader.GetOrdinal("PublicKey")),
-                    XorKey = Convert.ToBase64String((byte[])reader["XorKey"])
-                };
+                    return NotFound("No signing keys found for the current day window.");
+                }
 
-                return Ok(keyInfo);
+                return Ok(new { signingKeys = signingKeys });
             }
             catch (Exception ex)
             {
@@ -1565,8 +1681,8 @@ namespace FrtAfcBackend.Controllers
 
     public class ValidateTicketRequest
     {
-        [Required(ErrorMessage = "Ticket number is required")]
-        public required string TicketNumber { get; set; }
+        [Required(ErrorMessage = "Ticket input is required")]
+        public required string TicketInput { get; set; } // Changed from TicketNumber to TicketInput
 
         [StringLength(3, MinimumLength = 3, ErrorMessage = "Station code must be 3 characters")]
         [RegularExpression(@"^[A-Z]+$", ErrorMessage = "Station code must be uppercase letters")]
