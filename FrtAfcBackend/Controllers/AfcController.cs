@@ -1,12 +1,13 @@
-﻿using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Authorization;
-using System;
-using System.Data;
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Data;
+using System.IO;
 using System.Security.Cryptography;
 using System.Text;
-using System.IO;
-using System.ComponentModel.DataAnnotations;
 
 namespace FrtAfcBackend.Controllers
 {
@@ -1214,73 +1215,66 @@ namespace FrtAfcBackend.Controllers
             }
         }
 
-        // Get the current day's signing keys (3 AM to 3 AM next day) - NOW RETURNS ALL VALID KEYS
-        [HttpGet("currentdaykeys")]
+        // Get public keys for ticket validation (REQUIRES ValidateTickets permission)
+        // SECURITY: Only returns PUBLIC keys and XOR keys - NEVER private keys
+        [HttpGet("validationkeys")]
         [Authorize(AuthenticationSchemes = "BasicAuthentication")]
-        [RequirePermission(ApiPermissions.SystemAdmin)]
-        public IActionResult GetCurrentDaySigningKeys()
+        [RequirePermission(ApiPermissions.ValidateTickets)]
+        public IActionResult GetValidationKeys()
         {
             try
             {
                 using var connection = new SqlConnection(_connectionString);
                 connection.Open();
 
-                // Determine the correct key window
-                var now = DateTime.UtcNow;
-                var tz = TimeZoneInfo.FindSystemTimeZoneById(TimeZoneId);
-                var localNow = TimeZoneInfo.ConvertTimeFromUtc(now, tz);
-
-                // Calculate 3 AM boundaries - extend the window to include previous day's keys
-                DateTime start, end;
-                if (localNow.Hour < 3)
-                {
-                    // Between midnight and 3 AM: get both previous day's and current day's keys
-                    var prevDay = localNow.Date.AddDays(-1);
-                    start = prevDay.AddHours(3);
-                    end = localNow.Date.AddHours(3);
-                }
-                else
-                {
-                    // Otherwise: get current day's and next day's keys (for overlap period)
-                    start = localNow.Date.AddHours(3);
-                    end = localNow.Date.AddDays(1).AddHours(3);
-                }
-
-                // Query for ALL keys in the valid time window, ordered by creation time
+                // Query for PUBLIC KEYS ONLY - NEVER include PrivateKey column
                 using var cmd = new SqlCommand(@"
-                    SELECT KeyVersion, KeyCreated, PublicKey, XorKey
-                    FROM SigningKeys
-                    WHERE KeyCreated >= @start AND KeyCreated < @end
-                    ORDER BY KeyCreated DESC", connection);
+            SELECT sk.KeyVersion, sk.PublicKey, sk.StartDateTime, sk.ExpiryDateTime,
+                   ok.KeyBytes as XorKeyBytes
+            FROM SigningKeys sk
+            INNER JOIN ObfuscatingKeys ok ON sk.KeyVersion = ok.KeyVersion
+            WHERE sk.ExpiryDateTime > GETUTCDATE()
+            ORDER BY sk.KeyVersion DESC", connection);
 
-                cmd.Parameters.AddWithValue("@start", start);
-                cmd.Parameters.AddWithValue("@end", end);
-
-                var signingKeys = new List<object>();
+                var validationKeys = new List<object>();
                 using var reader = cmd.ExecuteReader();
-                
+
                 while (reader.Read())
                 {
+                    var publicKeyPem = reader.GetString("PublicKey");
+
+                    var publicKeyBase64 = publicKeyPem
+                        .Replace("-----BEGIN PUBLIC KEY-----", "")
+                        .Replace("-----END PUBLIC KEY-----", "")
+                        .Replace("\r", "").Replace("\n", "").Replace(" ", "").Trim();
+
                     var keyInfo = new
                     {
-                        KeyVersion = reader.GetInt32(reader.GetOrdinal("KeyVersion")),
-                        KeyCreated = reader.GetDateTime(reader.GetOrdinal("KeyCreated")),
-                        PublicKey = reader.GetString(reader.GetOrdinal("PublicKey")),
-                        XorKey = Convert.ToBase64String((byte[])reader["XorKey"])
+                        KeyVersion = reader.GetInt32("KeyVersion"),
+                        StartDateTime = reader.GetDateTime("StartDateTime"),
+                        ExpiryDateTime = reader.GetDateTime("ExpiryDateTime"),
+                        PublicKey = publicKeyBase64, // PUBLIC KEY ONLY
+                        XorKey = Convert.ToBase64String((byte[])reader["XorKeyBytes"])
+                        // NOTE: PrivateKey is NEVER included for security
                     };
-                    signingKeys.Add(keyInfo);
+                    validationKeys.Add(keyInfo);
                 }
 
-                if (signingKeys.Count == 0)
+                if (validationKeys.Count == 0)
                 {
-                    return NotFound("No signing keys found for the current day window.");
+                    return NotFound("No valid validation keys found.");
                 }
 
-                return Ok(new { signingKeys = signingKeys });
+                return Ok(new
+                {
+                    validationKeys = validationKeys,
+                    totalKeys = validationKeys.Count,
+                    retrievedAt = DateTime.UtcNow,
+                });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Failed to get current day's signing keys: {ex.Message}");
+                return StatusCode(500, $"Failed to get validation keys: {ex.Message}");
             }
         }
 
