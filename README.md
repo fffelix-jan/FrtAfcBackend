@@ -110,7 +110,7 @@ By default, Kestrel is configured for dual HTTP/HTTPS endpoints:
 
 ## License
 
-Copyright (c) 2026 Felix An
+Copyright (c) 2025 Felix An
 
 All rights reserved.
 
