@@ -1,6 +1,6 @@
 # FrtAfcBackend
 
-The backend of my graduate project demonstration metro ticketing system (Falloway Rapid Transit / **FRT**).
+The backend of my university capstone project demonstration metro ticketing system (Falloway Rapid Transit / **FRT**).
 
 This repository is a **Visual Studio solution** containing an **ASP.NET Core Web API** backend (targeting **.NET 8**) plus supporting utilities/scripts for database setup and data import.
 
